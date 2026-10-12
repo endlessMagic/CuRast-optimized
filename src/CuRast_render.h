@@ -5,11 +5,13 @@
 
 #include "Timer.h"
 #include "VKRenderer.h"
+#include "CudaVulkanFrameSync.h"
 #include "TextureManager.h"
 
 using namespace std;
 
 CudaVirtualMemory* cvm_framebuffer = nullptr;
+CudaVirtualMemory* cvm_framebufferNext = nullptr; // second framebuffer; frames alternate between the two
 CudaVirtualMemory* cvm_colorbuffer = nullptr;
 bool initialized = false;
 JpegTextures* jpegTextures = nullptr;
@@ -44,14 +46,16 @@ MappedTextures mapCudaVk(vector<shared_ptr<VKTexture>> textures){
 }
 
 void unmapCudaVk(MappedTextures& mappings){
-	// Ensure CUDA writes are complete before Vulkan blits the image
-	cuStreamSynchronize((CUstream)CU_STREAM_DEFAULT);
+	// The Vulkan submit waits for this signal on the GPU; the host does not block.
+	CudaVulkanFrameSync::cudaSignal((CUstream)CU_STREAM_DEFAULT);
 }
 
-void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebuffer, CudaModularProgram* prog_resolve){
+void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebuffer, CudaModularProgram* prog_resolve, cudaSurfaceObject_t surface, bool fromSurface){
 
 	uint64_t numPixels = target.width * target.height;
 	CUdeviceptr cptr_screenshot = MemoryManager::alloc(numPixels * 4, "screenshot");
+
+	bool sameSize = view.framebuffer->width == target.width && view.framebuffer->height == target.height;
 
 	uint32_t backgroundColor = 0;
 	uint8_t* bgRgba = (uint8_t*)&backgroundColor;
@@ -69,7 +73,13 @@ void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebu
 		&view.framebuffer->height,
 		&backgroundColor
 	};
-	prog_resolve->launch2D("kernel_resolve_colorbuffer_to_screenshot", args, target.width, target.height);
+	// Fused output does not write the colorbuffer; read the presented surface instead.
+	if(fromSurface && sameSize){
+		void* surfaceArgs[] = {&cptr_screenshot, &surface};
+		prog_resolve->launch2D("kernel_resolve_surface_to_screenshot", surfaceArgs, target.width, target.height);
+	}else{
+		prog_resolve->launch2D("kernel_resolve_colorbuffer_to_screenshot", args, target.width, target.height);
+	}
 
 	void* screenshot_host = nullptr;
 	cuMemAllocHost(&screenshot_host, 4 * numPixels);
@@ -89,7 +99,12 @@ void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebu
 
 	int stride_in_bytes = target.width * 4;
 	stbi_flip_vertically_on_write(1);
-	stbi_write_png(path.c_str(), target.width, target.height, 4, screenshot_host, stride_in_bytes);
+	int ok = stbi_write_png(path.c_str(), target.width, target.height, 4, screenshot_host, stride_in_bytes);
+
+	if (!ok)
+	{
+		printf("Failed to write png: %s\n", path.c_str());
+	}
 
 	MemoryManager::free(cptr_screenshot);
 	cuMemFreeHost(screenshot_host);
@@ -100,7 +115,10 @@ void saveScreenshot(RenderTarget target, View view, CUdeviceptr cptr_ssaoShadebu
 void drawTrianglesVisbuffer(
 	Scene* scene, View view, vector<CMesh>& meshes, 
 	vector<CMesh>& instances, CUdeviceptr cptr_meshes,
-	CUdeviceptr cptr_instances, CUdeviceptr cptr_transforms, CUdeviceptr cptr_triangleCountPrefixsum,
+	CUdeviceptr cptr_meshNumTriangles,
+	CUdeviceptr cptr_instances,
+	CUdeviceptr cptr_instanceNumTriangles,
+	CUdeviceptr cptr_transforms, CUdeviceptr cptr_triangleCountPrefixsum,
 	RenderTarget& target, MappedTextures& mappings
 ){
 	auto editor = CuRast::instance;
@@ -111,6 +129,9 @@ void drawTrianglesVisbuffer(
 	static CUdeviceptr cptr_hugeTrianglesCounter            = MemoryManager::alloc(4, "cptr_hugeTrianglesCounter");
 	static CUdeviceptr cptr_nontrivialCounter               = MemoryManager::alloc(4, "cptr_nontrivialCounter");
 	static CUdeviceptr cptr_nontrivialList                  = MemoryManager::alloc(8 * MAX_NONTRIVIAL_TRIANGLES, "cptr_nontrivialList");
+	static CUdeviceptr cptr_deferredCounter                 = MemoryManager::alloc(4, "cptr_deferredCounter");
+	static CUdeviceptr cptr_deferredProcessed               = MemoryManager::alloc(4, "cptr_deferredProcessed");
+	static CUdeviceptr cptr_deferredList                    = MemoryManager::alloc(8 * MAX_NONTRIVIAL_TRIANGLES, "cptr_deferredList");
 	static CUdeviceptr cptr_numProcessedHugeTriangles       = MemoryManager::alloc(4, "cptr_numProcessedHugeTriangles");
 	
 	static CudaModularProgram* prog = new CudaModularProgram({
@@ -119,8 +140,6 @@ void drawTrianglesVisbuffer(
 
 	if(instances.size() == 0) return;
 
-	auto custart = Timer::recordCudaTimestamp();
-
 	bool isCompressed = meshes[0].compressed;
 	string strCompressed = isCompressed ? "_compressed" : "_uncompressed";
 	string strInstanced = (CuRastSettings::rasterizer == RASTERIZER_VISBUFFER_INSTANCED) ? "_instanced" : "";
@@ -128,12 +147,28 @@ void drawTrianglesVisbuffer(
 	string strKernelStage1 = format("kernel_stage1_drawSmallTriangles_indexbuffer{}{}", strCompressed, strInstanced);
 	string strKernelStage2 = format("kernel_stage2_drawMediumTriangles_indexbuffer{}", strCompressed);
 	string strKernelStage3 = format("kernel_stage3_drawHugeTriangles_indexbuffer{}", strCompressed);
+	uint32_t stage1BlockSize = TRIANGLES_PER_SWEEP;
+
+	// Instanced, uncompressed geometry: 128-triangle Stage 1 batches; small triangles with more than
+	// 48 fragments are deferred from Stage 1 and rasterized by Stage 2 warps after the medium queue.
+	if (!isCompressed && CuRastSettings::rasterizer == RASTERIZER_VISBUFFER_INSTANCED) {
+		strKernelStage1 = "kernel_stage1_drawSmallTriangles_indexbuffer_uncompressed_instanced_128_defer48";
+		strKernelStage2 = "kernel_stage2_drawMediumTriangles_indexbuffer_uncompressed_deferred";
+		stage1BlockSize = 128;
+	}
+
+	// Stage 3 splits each 64-row tile into 16 row-range jobs.
+	if (strKernelStage3 == "kernel_stage3_drawHugeTriangles_indexbuffer_uncompressed") {
+		strKernelStage3 += "_rows16";
+	}
 
 	RasterArgs args;
 	args.meshes                          = (CMesh*)cptr_meshes;
 	args.numMeshes                       = meshes.size(); 
+	args.meshNumTriangles                = (uint32_t*)cptr_meshNumTriangles;
 	args.instances                       = (CMesh*)cptr_instances;
 	args.numInstances                    = instances.size();
+	args.instanceNumTriangles            = (uint32_t*)cptr_instanceNumTriangles;
 	args.transforms                      = (mat4*)cptr_transforms;
 	args.numProcessedBatches             = (uint32_t*)cptr_numProcessedBatches;
 	args.numProcessedBatches_nontrivial  = (uint32_t*)cptr_numProcessedBatches_nontrivial;
@@ -143,13 +178,19 @@ void drawTrianglesVisbuffer(
 	args.nontrivialTrianglesCounter      = (uint32_t*)cptr_nontrivialCounter;
 	args.nontrivialTrianglesList         = (uint64_t*)cptr_nontrivialList;
 	args.target                          = target;
+	args.deferredCounter                 = (uint32_t*)cptr_deferredCounter;
+	args.deferredList                    = (uint64_t*)cptr_deferredList;
+	args.deferredProcessed               = (uint32_t*)cptr_deferredProcessed;
 	
-	prog->launchCooperative(strKernelStage1, vector<void*>{&args}, {.blocksize = TRIANGLES_PER_SWEEP});
-	prog->launchCooperative(strKernelStage2, vector<void*>{&args});
-	prog->launchCooperative(strKernelStage3, vector<void*>{&args}, {.blocksize = 64});
-
-	auto cuend = Timer::recordCudaTimestamp();
-	Timer::recordDuration("<triangles visbuffer pipeline>", custart, cuend);
+	{
+		// The interval includes host submission gaps between the three launches.
+		auto custart = Timer::recordCudaTimestamp();
+		prog->launchCooperative(strKernelStage1, vector<void*>{&args}, {.blocksize = stage1BlockSize});
+		prog->launchCooperative(strKernelStage2, vector<void*>{&args});
+		prog->launchCooperative(strKernelStage3, vector<void*>{&args}, {.blocksize = 64});
+		auto cuend = Timer::recordCudaTimestamp();
+		Timer::recordDuration("<triangles visbuffer pipeline>", custart, cuend);
+	}
 }
 
 void CuRast::draw(Scene* scene, vector<View> views){
@@ -167,8 +208,16 @@ void CuRast::draw(Scene* scene, vector<View> views){
 
 	int supersamplingFactor = CuRastSettings::supersamplingFactor;
 
+	// Two framebuffers alternate per frame. The fused resolve clears the one the next frame uses,
+	// so the explicit clear only runs when the current buffer is not known to be clean.
+	static int framebufferIndex = 0;
+	static bool framebufferClean[2] = {false, false};
+	static int64_t framebufferPixels = 0;
+	CudaVirtualMemory* cvm_currentFramebuffer = framebufferIndex == 0 ? cvm_framebuffer : cvm_framebufferNext;
+	CudaVirtualMemory* cvm_otherFramebuffer = framebufferIndex == 0 ? cvm_framebufferNext : cvm_framebuffer;
+
 	RenderTarget target;
-	target.framebuffer = (uint64_t*)cvm_framebuffer->cptr;
+	target.framebuffer = (uint64_t*)cvm_currentFramebuffer->cptr;
 	target.colorbuffer = (uint64_t*)cvm_colorbuffer->cptr;
 	target.width = supersamplingFactor * view.framebuffer->width;
 	target.height = supersamplingFactor * view.framebuffer->height;
@@ -247,7 +296,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			uint32_t indexRange = node->mesh->index_max - node->mesh->index_min;
 			uint64_t bitsPerIndex = ceil(log2f(float(indexRange + 1)));
 
-			CMesh mesh;
+			CMesh mesh = {};
 			mesh.world                    = node->transform_global;
 			mesh.positions                = (vec3*)node->mesh->cptr_position;
 			mesh.uvs                      = (vec2*)node->mesh->cptr_uv;
@@ -283,18 +332,22 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		//----------------------------------------------
 		static vector<CMesh> meshes_unique;
 		static vector<CMesh> meshes_allInstances;
+		static vector<uint32_t> meshNumTriangles_unique;
+		static vector<uint32_t> meshNumTriangles_allInstances;
 		static vector<mat4> transforms;
 		static vector<uint64_t> triangleCountPrefixsum;
 		int64_t sum = 0;
 		
 		meshes_unique.resize(nodes.size());
 		meshes_allInstances.resize(nodes.size());
+		meshNumTriangles_allInstances.resize(nodes.size());
 		transforms.resize(nodes.size());
 		triangleCountPrefixsum.resize(nodes.size());
 		
 		process_parallel(nodes, [&](SNTriangles* node, int64_t index){
 			CMesh cmesh = toCMesh(node);
 			meshes_allInstances[index] = cmesh;
+			meshNumTriangles_allInstances[index] = cmesh.numTriangles;
 			transforms[index] = target.view * cmesh.world;
 		});
 
@@ -322,22 +375,32 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			uniqueMesh->instances.count++;
 		}
 		meshes_unique.resize(uniqueMeshCounter);
+		meshNumTriangles_unique.resize(meshes_unique.size());
+		for (int i = 0; i < meshes_unique.size(); i++) {
+			meshNumTriangles_unique[i] = meshes_unique[i].numTriangles;
+		}
 
 		// prep virtual memory for lots of nodes
 		static CudaVirtualMemory* cvm_meshes                    = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(CMesh), "cvm_meshes");
 		static CudaVirtualMemory* cvm_instances                 = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(CMesh), "cvm_instances");
+		static CudaVirtualMemory* cvm_meshNumTriangles          = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(uint32_t), "cvm_meshNumTriangles");
+		static CudaVirtualMemory* cvm_instanceNumTriangles      = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(uint32_t), "cvm_instanceNumTriangles");
 		static CudaVirtualMemory* cvm_transforms                = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(mat4), "cvm_transforms");
 		static CudaVirtualMemory* cvm_triangleCountPrefixsum    = MemoryManager::allocVirtualCuda(1'000'000 * sizeof(uint64_t), "cvm_triangleCountPrefixsum");
 		
 		// commit physical memory for actual amount of nodes
 		cvm_meshes                 ->commit(meshes_unique.size()          * sizeof(CMesh));
 		cvm_instances              ->commit(meshes_allInstances.size()    * sizeof(CMesh));
+		cvm_meshNumTriangles       ->commit(meshNumTriangles_unique.size()       * sizeof(uint32_t));
+		cvm_instanceNumTriangles   ->commit(meshNumTriangles_allInstances.size() * sizeof(uint32_t));
 		cvm_transforms             ->commit(transforms.size()             * sizeof(mat4));
 		cvm_triangleCountPrefixsum ->commit(triangleCountPrefixsum.size() * sizeof(uint64_t));
 
 		// submit per-frame geometry metadata to GPU
 		cuMemcpyHtoDAsync(cvm_meshes->cptr                 , meshes_unique.data(),          byteSizeOf(meshes_unique), 0);
 		cuMemcpyHtoDAsync(cvm_instances->cptr              , meshes_allInstances.data(),    byteSizeOf(meshes_allInstances), 0);
+		cuMemcpyHtoDAsync(cvm_meshNumTriangles->cptr       , meshNumTriangles_unique.data(),       byteSizeOf(meshNumTriangles_unique), 0);
+		cuMemcpyHtoDAsync(cvm_instanceNumTriangles->cptr   , meshNumTriangles_allInstances.data(), byteSizeOf(meshNumTriangles_allInstances), 0);
 		cuMemcpyHtoDAsync(cvm_transforms->cptr             , transforms.data(),             byteSizeOf(transforms), 0);
 		cuMemcpyHtoDAsync(cvm_triangleCountPrefixsum->cptr , triangleCountPrefixsum.data(), byteSizeOf(triangleCountPrefixsum), 0);
 
@@ -376,34 +439,49 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		// (so that we get more accurate timings for the other kernels)
 		static CUdeviceptr dummydata = MemoryManager::alloc(16, "dummydata");
 		prog->launch("kernel_dummy", {&dummydata}, 1);
+		Timer::Timestamp renderStart;
 		
 		{ // resize and clear cuda framebuffer
 			uint32_t clearColor = 0xff000000;
 			float clearDepth = Infinity;
+			bool preserveColorbufferDepth = CuRastSettings::showBoundingBoxes;
 
 			uint64_t requiredBytes = numPixels * 8;
-			cvm_framebuffer->commit(requiredBytes);
+			cvm_currentFramebuffer->commit(requiredBytes);
+			cvm_otherFramebuffer->commit(requiredBytes);
 			cvm_colorbuffer->commit(requiredBytes);
+			if(numPixels != framebufferPixels){
+				framebufferClean[0] = framebufferClean[1] = false;
+				framebufferPixels = numPixels;
+			}
+			renderStart = Timer::recordCudaTimestamp();
 
-			prog->launch("kernel_clearFramebuffer", {
-				&cvm_framebuffer->cptr,
-				&numPixels,
-				&clearColor,
-				&clearDepth
-			}, numPixels);
+			if(!framebufferClean[framebufferIndex]){
+				prog->launch("kernel_clearFramebuffer", {
+					&cvm_currentFramebuffer->cptr,
+					&numPixels,
+					&clearColor,
+					&clearDepth
+				}, numPixels);
+			}
 
-			prog->launch("kernel_clearFramebuffer", {
-				&cvm_colorbuffer->cptr,
-				&numPixels,
-				&clearColor,
-				&clearDepth
-			}, numPixels);
+			if(preserveColorbufferDepth){
+				prog->launch("kernel_clearFramebuffer", {
+					&cvm_colorbuffer->cptr,
+					&numPixels,
+					&clearColor,
+					&clearDepth
+				}, numPixels);
+			}
 		}
 
 		drawTrianglesVisbuffer(
 			scene, view, meshes_unique, meshes_allInstances, 
 			cvm_meshes->cptr, 
-			cvm_instances->cptr, cvm_transforms->cptr, cvm_triangleCountPrefixsum->cptr,
+			cvm_meshNumTriangles->cptr,
+			cvm_instances->cptr,
+			cvm_instanceNumTriangles->cptr,
+			cvm_transforms->cptr, cvm_triangleCountPrefixsum->cptr,
 			target, mappings
 		);
 		
@@ -415,7 +493,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 
 			vector<CMesh> boundingBoxNodes;
 			scene->forEach<SNTriangles>([&](SNTriangles* node){
-				CMesh mesh;
+				CMesh mesh = {};
 				mesh.world                    = node->transform_global;
 				mesh.aabb                     = node->aabb;
 
@@ -448,6 +526,7 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		rasterSettings.enableDiffuseLighting = CuRastSettings::enableDiffuseLighting;
 		rasterSettings.displayAttribute = CuRastSettings::displayAttribute;
 		rasterSettings.enableObjectPicking = CuRastSettings::enableObjectPicking;
+		rasterSettings.preserveColorbufferDepth = CuRastSettings::showBoundingBoxes;
 
 		JpegPipeline jpp;
 		jpp.toDecode             = (uint32_t*)jpegTextures->cptr_toDecode;
@@ -466,6 +545,19 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		}
 
 
+		// Fused output: resolve writes the graphics API surface directly, skipping the colorbuffer conversion pass.
+		bool useFusedOutput = false;
+		uint32_t backgroundColor = 0;
+		{
+			uint8_t* bgRgba = (uint8_t*)&backgroundColor;
+			bgRgba[0] = clamp(CuRastSettings::background.x * 256.0f, 0.0f, 255.0f);
+			bgRgba[1] = clamp(CuRastSettings::background.y * 256.0f, 0.0f, 255.0f);
+			bgRgba[2] = clamp(CuRastSettings::background.z * 256.0f, 0.0f, 255.0f);
+		}
+
+		// Pipelined present: the previous image must be blitted before CUDA writes the shared surface again.
+		CudaVulkanFrameSync::cudaWait((CUstream)CU_STREAM_DEFAULT);
+
 		{ // RESOLVE VISIBILITY BUFFER (write colors to colorbuffer)
 			void* args[] = {
 				&cvm_instances->cptr,
@@ -477,7 +569,35 @@ void CuRast::draw(Scene* scene, vector<View> views){
 				&rasterSettings,
 				&jpp,
 			};
-			prog->launch2D("kernel_resolve_visbuffer_to_colorbuffer2D", args, target.width, target.height);
+
+			bool useTextureFastResolve =
+				CuRastSettings::displayAttribute == DisplayAttribute::TEXTURE &&
+				!hasJpegCompressedTextures &&
+				!CuRastSettings::enableDiffuseLighting &&
+				!CuRastSettings::enableObjectPicking &&
+				!CuRastSettings::showWireframe;
+
+			useFusedOutput =
+				useTextureFastResolve &&
+				!CuRastSettings::showBoundingBoxes &&
+				!CuRastSettings::enableSSAO &&
+				view.framebuffer->width == target.width &&
+				view.framebuffer->height == target.height;
+
+			if(useFusedOutput){
+				// Shading, eye-dome lighting and output in one kernel; it also clears the next frame's framebuffer.
+				void* fusedArgs[] = {
+					&cvm_instances->cptr, &numInstances, &cvm_triangleCountPrefixsum->cptr, &mouse_X, &mouse_Y,
+					&cptr_state, &rasterSettings, &jpp, &mappings.surfaces[0], &CuRastSettings::enableEDL,
+					&backgroundColor, &cvm_otherFramebuffer->cptr,
+				};
+				prog->launch2D("kernel_resolve_visbuffer_to_surface2D_texture_fast_edl_offsets_tuned_clearnext", fusedArgs, target.width, target.height);
+				framebufferClean[framebufferIndex ^ 1] = true;
+			}else if(useTextureFastResolve){
+				prog->launch2D("kernel_resolve_visbuffer_to_colorbuffer2D_texture_fast", args, target.width, target.height);
+			}else{
+				prog->launch2D("kernel_resolve_visbuffer_to_colorbuffer2D", args, target.width, target.height);
+			}
 		}
 
 		if(hasJpegCompressedTextures){
@@ -593,13 +713,13 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		static CudaVirtualMemory* cvm_ssaoShadebuffer = MemoryManager::allocVirtualCuda(2'000'000'000, "cvm_ssaoShadebuffer");
 		if(CuRastSettings::enableSSAO){
 			// save mem by using reusing the visibility buffer, which is no longer used in this frame
-			CUdeviceptr cptr_occlusionbuffer = cvm_framebuffer->cptr;
+			CUdeviceptr cptr_occlusionbuffer = cvm_currentFramebuffer->cptr;
 
 			// But for the final ssao shading values, we need an extra buffer
-			cvm_ssaoShadebuffer->commit(cvm_framebuffer->comitted / 2);
+			cvm_ssaoShadebuffer->commit(cvm_currentFramebuffer->comitted / 2);
 
 			void* argsSSAO[] = {
-				&cvm_framebuffer->cptr,
+				&cvm_currentFramebuffer->cptr,
 				&cvm_ssaoShadebuffer->cptr
 			};
 			prog->launch2D("kernel_ssaoOcclusion", argsSSAO, target.width, target.height);
@@ -620,15 +740,9 @@ void CuRast::draw(Scene* scene, vector<View> views){
 		// 	&CuRastSettings::enableSSAO,
 		// });
 
-		{ // RESOLVE COLOR BUFFER (write to graphics API framebuffer)
+		if(!useFusedOutput){ // RESOLVE COLOR BUFFER (write to graphics API framebuffer)
 			int viewWidth = view.framebuffer->width;
 			int viewHeight = view.framebuffer->height;
-
-			uint32_t backgroundColor = 0;
-			uint8_t* bgRgba = (uint8_t*)&backgroundColor;
-			bgRgba[0] = clamp(CuRastSettings::background.x * 256.0f, 0.0f, 255.0f);
-			bgRgba[1] = clamp(CuRastSettings::background.y * 256.0f, 0.0f, 255.0f);
-			bgRgba[2] = clamp(CuRastSettings::background.z * 256.0f, 0.0f, 255.0f);
 
 			void* args[] = {
 				&mappings.surfaces[0],
@@ -645,9 +759,16 @@ void CuRast::draw(Scene* scene, vector<View> views){
 			prog->launch2D("kernel_resolve_colorbuffer_to_opengl_2D", args, target.width, target.height);
 		}
 
+		// Clear through final color resolve, excluding screenshot/readback/presentation.
+		Timer::recordDuration("<CUDA render interval>", renderStart, Timer::recordCudaTimestamp());
+
 		if(CuRastSettings::requestScreenshot){
-			saveScreenshot(target, view, cvm_ssaoShadebuffer->cptr, prog);
+			saveScreenshot(target, view, cvm_ssaoShadebuffer->cptr, prog, mappings.surfaces[0], useFusedOutput);
 		}
+
+		// This frame's framebuffer is now dirty; the next frame uses the other one.
+		framebufferClean[framebufferIndex] = false;
+		framebufferIndex ^= 1;
 
 		unmapCudaVk(mappings);
 		
@@ -665,6 +786,7 @@ void initialize(){
 	// int max_SuperSamples = 16;
 	cvm_framebuffer = MemoryManager::allocVirtualCuda(virtualCapacity, "framebuffer");
 	cvm_framebuffer->commit(8 * defaultPixels);
+	cvm_framebufferNext = MemoryManager::allocVirtualCuda(virtualCapacity, "framebuffer next");
 
 	cvm_colorbuffer = MemoryManager::allocVirtualCuda(virtualCapacity, "colorbuffer");
 	cvm_colorbuffer->commit(8 * defaultPixels);

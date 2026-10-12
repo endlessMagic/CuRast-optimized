@@ -1,3 +1,53 @@
+# CuRast — performance-optimized fork
+
+This is a fork of [m-schuetz/CuRast](https://github.com/m-schuetz/CuRast) (AGPL-3.0). It optimizes the CUDA rasterization pipeline while keeping the rendered images **bit-identical** to the original. The original README follows below.
+
+## Results
+
+RTX 3070 Ti, 1920 × 1080, upstream `c4b38fd` vs this fork, same machine and build settings. Values are the median over processes of per-process medians (8 processes per version for Hakone, 4 for the others; 1000 warm-up + 200 measured frames each; versions interleaved).
+
+| Scene | GPU kernel time per frame, upstream → fork | Speedup | End-to-end GPU frame interval, upstream → fork | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Hakone (1 M triangles) | 515.6 → 270.3 µs | **1.91×** | 563.2 → 321.8 µs | 1.75× |
+| Hakone, 3 instances | 749.6 → 459.6 µs | **1.63×** | 789.5 → 514.0 µs | 1.54× |
+| Donaukanal | 511.0 → 259.1 µs | **1.97×** | 528.4 → 309.8 µs | 1.71× |
+
+*GPU kernel time* is the sum of all kernels in a frame (CUDA events). The *frame interval* runs from the first to the last GPU event of a frame. It also includes idle time while the CPU is still submitting work, which this fork does not target. The wall-clock frame period on Hakone drops from 1044.5 to 604.3 µs.
+
+## What changed
+
+- **Stage 1 (small triangles):** persistent cooperative kernel with 128-triangle batches and a 56-register cap. Small triangles that turn out heavy (more than 48 fragments) are deferred and rasterized in otherwise idle slots at the end of Stage 2.
+- **Stage 2 (medium triangles):** clipping skips the screen edges a triangle doesn't cross (identical output, about 80% less local-memory traffic in Stage 2).
+- **Stage 3 (huge triangles):** row-sliced tile jobs for this latency-bound stage, about 3× faster.
+- **Resolve (shading):**
+  - Shading, eye-dome lighting and output are fused into one kernel that writes the presentation surface directly. This removes an 8-byte-per-pixel intermediate buffer, a kernel launch and about 33 MB of DRAM traffic per frame.
+  - Integer neighbour offsets for eye-dome lighting (18% fewer instructions).
+  - Launch-coordinate indexing, bounded texel wrap, closed-form mip selection, a 64-register cap, and shorter register lifetimes in the texture path.
+  - The framebuffer clear is folded into the fused kernel, using two alternating framebuffers.
+- **Presentation:** the CUDA → Vulkan handoff uses a shared timeline semaphore instead of host synchronization every frame. The CPU no longer waits for the GPU each frame, which shortens the frame time by about 14%.
+
+## How it was done
+
+The work was a measurement-driven campaign:
+- **Benchmarking:** every candidate was measured with interleaved multi-process A/B runs.
+- **Profiling:** Nsight Compute and Nsight Systems, down to SASS stall attribution.
+- **Correctness:** a candidate was kept only if all test images stayed pixel-identical to reference renders. Additional checks were a frame-by-frame differential test across rendering modes and compute-sanitizer.
+- **AI agents:** the implementation was carried out with AI coding agents (OpenAI Codex, Claude Code) under my direction.
+
+## Reproducing the numbers
+
+1. Build as described under *Installing* below.
+2. Put `hakone_1M.glb` (download link in the data set table below) and `example_donaukanal_urania.glb` (in this repository's root) into `resources/`.
+3. Run from the repository root (kernels are compiled at start-up from `./src/kernels`). Fixtures are `hakone`, `hakone-instances` and `donaukanal`:
+
+```
+build\Release\CuRast.exe --headless --benchmark-fixture hakone --benchmark-width 1920 --benchmark-height 1080 --benchmark-warmup 1000 --benchmark-frames 200 --benchmark-output hakone.jsonl
+```
+
+CuRast sets `CUDA_CACHE_DISABLE=1` itself unless the variable is already set. With the CUDA cache enabled, nvJitLink can crash intermittently while the kernels are linked at start-up. All numbers above were measured with the cache disabled.
+
+---
+
 
 # CuRast: Cuda-Based Software Rasterization for Billions of Triangles
 

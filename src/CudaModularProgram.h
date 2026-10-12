@@ -56,7 +56,7 @@ struct OptionalLaunchSettings{
 	uint32_t blocksize = 0;
 	vector<void*> args;
 	bool measureDuration = false;
-	CUstream stream;
+	CUstream stream = 0;
 };
 
 struct CudaModule{
@@ -236,6 +236,7 @@ struct CudaModularProgram{
 	unordered_map<string, int> launches_per_frame;
 
 	inline static vector<CudaModularProgram*> instances;
+	inline static bool watchSourceFiles = true;
 	mutex mtx_instances;
 
 	CudaModularProgram(){
@@ -310,10 +311,12 @@ struct CudaModularProgram{
 
 			module->compile();
 
-			monitorFile(modulePath, [&, module]() {
-				module->compile();
-				link();
-			});
+			if(watchSourceFiles){
+				monitorFile(modulePath, [&, module]() {
+					module->compile();
+					link();
+				});
+			}
 
 			modules.push_back(module);
 		}
@@ -464,9 +467,10 @@ struct CudaModularProgram{
 	}
 
 	void launch(string kernelName, void** args, OptionalLaunchSettings launchArgs){
-		auto custart = Timer::recordCudaTimestamp();
+		auto kernel = kernels.at(kernelName);
+		auto custart = Timer::recordCudaTimestamp(launchArgs.stream);
 
-		auto res_launch = cuLaunchKernel(kernels[kernelName],
+		auto res_launch = cuLaunchKernel(kernel,
 			launchArgs.gridsize, 1, 1,
 			launchArgs.blocksize, 1, 1,
 			0, launchArgs.stream, args, nullptr);
@@ -480,7 +484,8 @@ struct CudaModularProgram{
 			println("kernel: {}", kernelName);
 		}
 
-		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp());
+		Timer::checkCuda(res_launch);
+		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp(launchArgs.stream));
 	}
 
 	void launch(string kernelName, vector<void*> args, int count, CUstream stream = 0){
@@ -505,16 +510,17 @@ struct CudaModularProgram{
 		uint32_t blockSize = 256;
 		uint32_t gridSize = (count + blockSize - 1) / blockSize;
 
-		auto custart = Timer::recordCudaTimestamp();
+		auto kernel = kernels.at(kernelName);
+		auto custart = Timer::recordCudaTimestamp(stream);
 
-		auto res_launch = cuLaunchKernel(kernels[kernelName],
+		auto res_launch = cuLaunchKernel(kernel,
 			gridSize, 1, 1,
 			blockSize, 1, 1,
 			0, stream, args, nullptr);
 
 		CURuntime::assertCudaSuccess(res_launch);
 
-		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp());
+		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp(stream));
 	}
 
 	void launch2D(string kernelName, void** args, int width, int height, CUstream stream = 0){
@@ -526,15 +532,17 @@ struct CudaModularProgram{
 		CUevent event_start = events_launch_start[kernelName];
 		CUevent event_end   = events_launch_end[kernelName];
 
-		uint32_t blockSize = 8;
-		uint32_t gridSizeX = (width + blockSize - 1) / blockSize;
-		uint32_t gridSizeY = (height + blockSize - 1) / blockSize;
+		uint32_t blockSizeY = 8;
+		uint32_t blockSizeX = 16;
+		uint32_t gridSizeX = (width + blockSizeX - 1) / blockSizeX;
+		uint32_t gridSizeY = (height + blockSizeY - 1) / blockSizeY;
 
-		auto custart = Timer::recordCudaTimestamp();
+		auto kernel = kernels.at(kernelName);
+		auto custart = Timer::recordCudaTimestamp(stream);
 
-		auto res_launch = cuLaunchKernel(kernels[kernelName],
+		auto res_launch = cuLaunchKernel(kernel,
 			gridSizeX, gridSizeY, 1,
-			blockSize, blockSize, 1,
+			blockSizeX, blockSizeY, 1,
 			0, stream, args, nullptr);
 
 		if (res_launch != CUDA_SUCCESS) {
@@ -548,7 +556,7 @@ struct CudaModularProgram{
 			exit(42415);
 		}
 
-		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp());
+		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp(stream));
 	}
 
 	void launchCooperative(string kernelName, vector<void*> args, OptionalLaunchSettings launchArgs = {}){
@@ -558,19 +566,18 @@ struct CudaModularProgram{
 	}
 
 	void launchCooperative(string kernelName, void** args, OptionalLaunchSettings launchArgs = {}){
-
-		auto custart = Timer::recordCudaTimestamp();
+		auto kernel = kernels.at(kernelName);
 
 		CUdevice device;
 		int numSMs;
-		cuCtxGetDevice(&device);
-		cuDeviceGetAttribute(&numSMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+		Timer::checkCuda(cuCtxGetDevice(&device));
+		Timer::checkCuda(cuDeviceGetAttribute(&numSMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
 
 		
 		int blockSize = launchArgs.blocksize > 0 ? launchArgs.blocksize : 128;
 
 		int numBlocks;
-		CUresult resultcode = cuOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernels[kernelName], blockSize, 0);
+		CUresult resultcode = cuOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernel, blockSize, 0);
 		CURuntime::assertCudaSuccess(resultcode);
 
 		numBlocks *= numSMs;
@@ -579,14 +586,14 @@ struct CudaModularProgram{
 		// make sure at least 10 workgroups are spawned)
 		numBlocks = std::clamp(numBlocks, 10, 100'000);
 
-		auto kernel = this->kernels[kernelName];
+		auto custart = Timer::recordCudaTimestamp(launchArgs.stream);
 		auto res_launch = cuLaunchCooperativeKernel(kernel,
 			numBlocks, 1, 1,
 			blockSize, 1, 1,
 			0, launchArgs.stream, args);
 		CURuntime::assertCudaSuccess(res_launch);
 
-		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp());
+		Timer::recordDuration(kernelName, custart, Timer::recordCudaTimestamp(launchArgs.stream));
 	}
 
 	void clearTimings(){

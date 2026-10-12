@@ -3,6 +3,8 @@
 #include <vector>
 #include <queue>
 #include <string>
+#include <cstdio>
+#include <cstdlib>
 
 #include "cuda.h"
 #include <vulkan/vulkan.h>
@@ -31,6 +33,14 @@ struct Timer{
 	inline static vector<Timestamp> timestamps;
 	inline static vector<Recording> recordings;
 
+	static void checkCuda(CUresult result){
+		if(result == CUDA_SUCCESS) return;
+		const char* description = nullptr;
+		cuGetErrorString(result, &description);
+		fprintf(stderr, "CUDA timing/launch error %d: %s\n", int(result), description ? description : "unknown");
+		exit(1);
+	}
+
 	// ---- Vulkan ----
 	static constexpr uint32_t VK_QUERIES_PER_FRAME = 10;
 	inline static VkQueryPool  vkPool              = VK_NULL_HANDLE;
@@ -49,7 +59,7 @@ struct Timer{
 
 				Timestamp timestamp;
 
-				cuEventCreate(&timestamp.cudaEvent, CU_EVENT_DEFAULT);
+				checkCuda(cuEventCreate(&timestamp.cudaEvent, CU_EVENT_DEFAULT));
 
 				pool.push(timestamp);
 			}
@@ -58,15 +68,20 @@ struct Timer{
 		}
 	}
 
-	static Timestamp recordCudaTimestamp(){
+	static Timestamp recordCudaTimestamp(CUstream stream = 0){
 
 		if(!enabled) return Timestamp();
 		init();
 
-		Timestamp timestamp = pool.front();
-		pool.pop();
+		Timestamp timestamp;
+		if(pool.empty()){
+			checkCuda(cuEventCreate(&timestamp.cudaEvent, CU_EVENT_DEFAULT));
+		}else{
+			timestamp = pool.front();
+			pool.pop();
+		}
 
-		cuEventRecord(timestamp.cudaEvent, 0);
+		checkCuda(cuEventRecord(timestamp.cudaEvent, stream));
 
 		timestamps.push_back(timestamp);
 
@@ -86,16 +101,42 @@ struct Timer{
 		recordings.push_back(recording);
 	}
 
+	inline static vector<Timestamp> deferredTimestamps;
+	inline static vector<Recording> deferredRecordings;
+
+	// Pipelined frames: return the previous frame's recordings, waiting only for their events,
+	// and keep this frame's recordings pending. A second call after the last frame flushes it.
+	static vector<Recording> resolveDeferred(){
+		vector<Recording> previous = std::move(deferredRecordings);
+		vector<Timestamp> previousTimestamps = std::move(deferredTimestamps);
+		deferredRecordings = std::move(recordings);
+		deferredTimestamps = std::move(timestamps);
+		recordings.clear();
+		timestamps.clear();
+
+		for(Recording& recording : previous){
+			checkCuda(cuEventSynchronize(recording.end.cudaEvent));
+			float duration;
+			checkCuda(cuEventElapsedTime(&duration, recording.start.cudaEvent, recording.end.cudaEvent));
+			recording.milliseconds = duration;
+		}
+
+		for(Timestamp timestamp : previousTimestamps){
+			pool.push(timestamp);
+		}
+
+		return previous;
+	}
+
 	// Evaluate all pending timestamp queries, then clear them and put them back into the pool
 	static vector<Recording> resolve(){
 
-		if(!enabled) return vector<Recording>();
-		init();
+		if(recordings.empty()) return vector<Recording>();
+		checkCuda(cuCtxSynchronize());
 
 		for(Recording& recording : recordings){
-			cuCtxSynchronize();
 			float duration;
-			cuEventElapsedTime(&duration, recording.start.cudaEvent, recording.end.cudaEvent);
+			checkCuda(cuEventElapsedTime(&duration, recording.start.cudaEvent, recording.end.cudaEvent));
 
 			recording.milliseconds = duration;
 		}

@@ -522,3 +522,6 @@ make.bat
 dbg.glb.json
 screenshots/*
 benchmarks/*
+
+# Benchmark scenes (download separately, see README)
+resources/*.glb

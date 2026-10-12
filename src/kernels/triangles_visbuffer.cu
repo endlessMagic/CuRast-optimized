@@ -83,6 +83,7 @@ template<IndexFetch INDEXING, Compression COMPRESSION>
 void rasterize(
 	const RasterArgs args,
 	const CMesh& sh_mesh,
+	uint32_t meshNumTriangles,
 	int meshIndex,
 	const mat4& worldView,
 	int triangleIndex,
@@ -92,7 +93,7 @@ void rasterize(
 	vec4 c_object
 ){
 
-	if(triangleIndex >= sh_mesh.numTriangles) return;
+	if(triangleIndex >= meshNumTriangles) return;
 
 	// if(sh_mesh.numTriangles > 7) return;
 	// if(triangleIndex != 3) return;
@@ -286,7 +287,7 @@ void rasterize(
 						// float depth = 1.0f / inv_depth; 
 
 						uint64_t pixel = pack_pixel(depth, 
-							sh_mesh.cummulativeTriangleCount + triangleIndex + instanceIndex * sh_mesh.numTriangles
+							sh_mesh.cummulativeTriangleCount + triangleIndex + instanceIndex * meshNumTriangles
 						);
 						atomicMin(&args.target.framebuffer[pixelID], pixel);
 					}
@@ -307,7 +308,7 @@ void rasterize(
 }
 
 
-template<IndexFetch INDEXING, Compression COMPRESSION, Instancing INSTANCING>
+template<IndexFetch INDEXING, Compression COMPRESSION, Instancing INSTANCING, uint32_t TRIANGLES_PER_BATCH = TRIANGLES_PER_SWEEP>
 void stage1_drawSmallTriangles(RasterArgs& args){
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -325,12 +326,14 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 	__shared__ int sh_blockBatchIndex;
 	__shared__ int sh_blockLocalBatchIndex;
 	__shared__ int sh_meshIndex;
+	__shared__ uint32_t sh_meshNumTriangles;
 	__shared__ CMesh sh_mesh;
 
 	if (block.thread_rank() == 0){
 		sh_blockBatchIndex = 0;
 		sh_blockLocalBatchIndex = 0;
 		sh_meshIndex = 0;
+		sh_meshNumTriangles = args.meshNumTriangles[0];
 		sh_mesh = args.meshes[0];
 	}
 
@@ -340,6 +343,7 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 	while (true){
 
 		// Claim Work: Check which batch of triangles this block should render next.
+		// All warps must finish reading the previous shared batch/mesh first.
 		block.sync();
 		if (block.thread_rank() == 0){
 
@@ -351,7 +355,7 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 			
 			// Next batch is outside of current mesh.
 			// Advance through meshes to the one containing the next batch
-			int numBatchesInMesh = (sh_mesh.numTriangles + TRIANGLES_PER_SWEEP - 1) / TRIANGLES_PER_SWEEP;
+			int numBatchesInMesh = (sh_meshNumTriangles + TRIANGLES_PER_BATCH - 1) / TRIANGLES_PER_BATCH;
 			while (sh_blockLocalBatchIndex >= numBatchesInMesh){
 				sh_meshIndex++;
 
@@ -359,18 +363,19 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 					// Treats list of instances as list of meshes
 					if (sh_meshIndex >= args.numInstances) break;
 					sh_blockLocalBatchIndex -= numBatchesInMesh;
+					sh_meshNumTriangles = args.instanceNumTriangles[sh_meshIndex];
 					sh_mesh = args.instances[sh_meshIndex];
-					numBatchesInMesh = (sh_mesh.numTriangles + TRIANGLES_PER_SWEEP - 1) / TRIANGLES_PER_SWEEP;
+					numBatchesInMesh = (sh_meshNumTriangles + TRIANGLES_PER_BATCH - 1) / TRIANGLES_PER_BATCH;
 				}else if constexpr (INSTANCING == Instancing::YES){
 					if (sh_meshIndex >= args.numMeshes) break;
 					sh_blockLocalBatchIndex -= numBatchesInMesh;
+					sh_meshNumTriangles = args.meshNumTriangles[sh_meshIndex];
 					sh_mesh = args.meshes[sh_meshIndex];
-					numBatchesInMesh = (sh_mesh.numTriangles + TRIANGLES_PER_SWEEP - 1) / TRIANGLES_PER_SWEEP;
+					numBatchesInMesh = (sh_meshNumTriangles + TRIANGLES_PER_BATCH - 1) / TRIANGLES_PER_BATCH;
 				}
 			}
 		}
 		block.sync();
-
 
 		if constexpr (INSTANCING == Instancing::NO){
 			// Treats list of instances as list of meshes
@@ -378,15 +383,18 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 		}else if constexpr (INSTANCING == Instancing::YES){
 			if (sh_meshIndex >= args.numMeshes) return;
 		}
+		CMesh mesh = sh_mesh;
+		int meshIndex = sh_meshIndex;
+		uint32_t meshNumTriangles = sh_meshNumTriangles;
 
-		uint32_t firstTriangleInBatch = sh_blockLocalBatchIndex * TRIANGLES_PER_SWEEP;
+		uint32_t firstTriangleInBatch = sh_blockLocalBatchIndex * TRIANGLES_PER_BATCH;
 		int triangleIndex = firstTriangleInBatch + block.thread_rank();
 
-		if(triangleIndex >= sh_mesh.numTriangles) continue;
+		if(triangleIndex >= meshNumTriangles) continue;
 
-		vec4 a_object = getVertex<INDEXING, COMPRESSION>(sh_mesh, 3 * triangleIndex + 0);
-		vec4 b_object = getVertex<INDEXING, COMPRESSION>(sh_mesh, 3 * triangleIndex + 1);
-		vec4 c_object = getVertex<INDEXING, COMPRESSION>(sh_mesh, 3 * triangleIndex + 2);
+		vec4 a_object = getVertex<INDEXING, COMPRESSION>(mesh, 3 * triangleIndex + 0);
+		vec4 b_object = getVertex<INDEXING, COMPRESSION>(mesh, 3 * triangleIndex + 1);
+		vec4 c_object = getVertex<INDEXING, COMPRESSION>(mesh, 3 * triangleIndex + 2);
 
 		// if(triangleIndex == 200'000'000){
 
@@ -401,16 +409,16 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 		// }
 		
 		if constexpr (INSTANCING == Instancing::NO){
-			mat4 worldView = args.transforms[sh_mesh.instances.offset];
+			mat4 worldView = args.transforms[mesh.instances.offset];
 			rasterize<INDEXING, COMPRESSION>(
-				args, sh_mesh, sh_meshIndex, worldView, triangleIndex, 0, 
+				args, mesh, meshNumTriangles, meshIndex, worldView, triangleIndex, 0, 
 				a_object, b_object, c_object
 			);
 		}else if constexpr (INSTANCING == Instancing::YES){
-			for(int instanceIndex = 0; instanceIndex < sh_mesh.instances.count; instanceIndex++){
-				mat4 worldView = args.transforms[sh_mesh.instances.offset + instanceIndex];
+			for(int instanceIndex = 0; instanceIndex < mesh.instances.count; instanceIndex++){
+				mat4 worldView = args.transforms[mesh.instances.offset + instanceIndex];
 				rasterize<INDEXING, COMPRESSION>(
-					args, sh_mesh, sh_meshIndex, worldView, triangleIndex, instanceIndex, 
+					args, mesh, meshNumTriangles, meshIndex, worldView, triangleIndex, instanceIndex, 
 					a_object, b_object, c_object);
 			}
 		}
@@ -421,7 +429,211 @@ void stage1_drawSmallTriangles(RasterArgs& args){
 
 
 
-template<IndexFetch INDEXING, Compression COMPRESSION>
+namespace Stage2PlaneClipping {
+
+	// Generalizing the clipping boundary for branchless math
+	struct ClipEdge {
+		int axis;	 // 0 for X, 1 for Y
+		float sign;   // 1.0 for Max, -1.0 for Min
+		float value;  // The clipping constant (e.g., 1.0f)
+	};
+
+	__device__ inline bool isInside(const vec2 p, const ClipEdge e) {
+		// Returns true if point is on the "inside" of the clipping plane
+		// e.g., for Left: p.x > -1.0f  =>  p.x * 1.0 > -1.0
+		float val = (e.axis == 0) ? p.x : p.y;
+		return (e.sign * val >= e.sign * e.value);
+	}
+
+	__device__ inline vec2 intersect(vec2 p1, vec2 p2, const ClipEdge e) {
+		float t;
+		if (e.axis == 0) { // Vertical Clip (Left/Right)
+			t = (e.value - p1.x) / (p2.x - p1.x);
+			return { e.value, p1.y + t * (p2.y - p1.y) };
+		} else { // Horizontal Clip (Top/Bottom)
+			t = (e.value - p1.y) / (p2.y - p1.y);
+			return { p1.x + t * (p2.x - p1.x), e.value };
+		}
+	}
+
+	__device__ void windowClipping(const vec2 a, const vec2 b, const vec2 c, vec2* boxMin, vec2* boxMax) {
+		// We use two small buffers on the stack (registers)
+		vec2 bufferA[8];
+		vec2 bufferB[8];
+		
+		vec2* in = bufferA;
+		vec2* out = bufferB;
+
+		in[0] = a; in[1] = b; in[2] = c;
+		int inCount = 3;
+
+		// Define the 4 boundaries: Left, Right, Bottom, Top
+		const ClipEdge edges[4] = {
+			{0,  1.0f, -1.0f}, // Left:   x > -1
+			{0, -1.0f,  1.0f}, // Right:  x <  1
+			{1,  1.0f, -1.0f}, // Bottom: y > -1
+			{1, -1.0f,  1.0f}  // Top:	y <  1
+		};
+
+		#pragma unroll
+		for (int e = 0; e < 4; e++) {
+			if (isInside(a, edges[e]) && isInside(b, edges[e]) && isInside(c, edges[e])) continue;
+			int outCount = 0;
+			if (inCount == 0) break;
+
+			vec2 S = in[inCount - 1]; // Start with the last point
+			for (int i = 0; i < inCount; i++) {
+				vec2 E = in[i];
+				bool E_inside = isInside(E, edges[e]);
+				bool S_inside = isInside(S, edges[e]);
+
+				if (E_inside) {
+					if (!S_inside) {
+						out[outCount++] = intersect(S, E, edges[e]);
+					}
+					out[outCount++] = E;
+				} else if (S_inside) {
+					out[outCount++] = intersect(S, E, edges[e]);
+				}
+				S = E;
+			}
+			
+			// Ping-pong buffers: current 'out' becomes next 'in'
+			vec2* temp = in;
+			in = out;
+			out = temp;
+			inCount = outCount;
+		}
+
+		// printf("inCount: %d\n", inCount);
+		for (int i = 0; i < inCount; i++) {
+			vec2 p = in[i]; // Use 'in' because the final swap moved the result there
+			boxMin->x = fminf(boxMin->x, p.x);
+			boxMin->y = fminf(boxMin->y, p.y);
+			boxMax->x = fmaxf(boxMax->x, p.x);
+			boxMax->y = fmaxf(boxMax->y, p.y);
+		}
+	}
+}
+
+__device__ void stage2_computeBounds(
+	vec3 a_ndc, vec3 b_ndc, vec3 c_ndc,
+	vec3 a_view, vec3 b_view, vec3 c_view,
+	mat4 worldView, float f, float aspect,
+	float width, float height,
+	float* min_x, float* max_x,
+	float* min_y, float* max_y
+) {
+	vec2 boxMin = {1e10f, 1e10f};
+	vec2 boxMax = {-1e10f, -1e10f};
+
+	// 1. Bitmask for vertices behind near plane (z <= 0 in NDC usually means behind)
+	// Using a bitmask reduces branching logic.
+	int mask = (a_ndc.z <= 0.0f ? 1 : 0) | 
+			   (b_ndc.z <= 0.0f ? 2 : 0) | 
+			   (c_ndc.z <= 0.0f ? 4 : 0);
+
+	// 2. Early exit if all are behind
+	if (mask == 7) return;
+
+	// Optimization: View-to-plane intersection for Z-aligned planes doesn't need normalize()
+	constexpr float near = 0.01f;
+	auto intersectNear = [&](vec3 p1, vec3 p2) {
+		float t = (-near - p1.z) / (p2.z - p1.z);
+		return p1 + t * (p2 - p1);
+	};
+
+	auto extend = [&](vec2 point){
+		boxMin.x = min(boxMin.x, point.x);
+		boxMax.x = max(boxMax.x, point.x);
+		boxMin.y = min(boxMin.y, point.y);
+		boxMax.y = max(boxMax.y, point.y);
+	};
+
+	constexpr bool USE_SUTHERLAND = true;
+
+	if (mask == 0) {
+		// All in front - the fast path
+
+		if constexpr(USE_SUTHERLAND){
+			Stage2PlaneClipping::windowClipping(a_ndc, b_ndc, c_ndc, &boxMin, &boxMax);
+		}else{
+			extend(a_ndc);
+			extend(b_ndc);
+			extend(c_ndc);
+		}
+
+	} else {
+		// Handle cases with 1 or 2 points behind using a unified triangle fan approach
+		// We identify the 'unique' vertex (the one that is alone in front or alone behind)
+		vec3 v[3], v_view[3];
+		if (mask == 1 || mask == 6) { v_view[0] = a_view; v_view[1] = b_view; v_view[2] = c_view; }
+		else if (mask == 2 || mask == 5) { v_view[0] = b_view; v_view[1] = c_view; v_view[2] = a_view; }
+		else { v_view[0] = c_view; v_view[1] = a_view; v_view[2] = b_view; }
+
+		if (mask == 1 || mask == 2 || mask == 4) {
+			// TWO points in front, ONE behind (mask has 1 bit set)
+			// This creates a quadrilateral, which we treat as two triangles
+			vec3 I1 = intersectNear(v_view[0], v_view[1]);
+			vec3 I2 = intersectNear(v_view[0], v_view[2]);
+			
+			vec2 p0 = viewToNDC(v_view[1], f, aspect);
+			vec2 p1 = viewToNDC(v_view[2], f, aspect);
+			vec2 pI1 = viewToNDC(I1, f, aspect);
+			vec2 pI2 = viewToNDC(I2, f, aspect);
+
+			if constexpr(USE_SUTHERLAND){
+				Stage2PlaneClipping::windowClipping(p0, p1, pI1, &boxMin, &boxMax);
+				Stage2PlaneClipping::windowClipping(pI1, p1, pI2, &boxMin, &boxMax);
+			}else{
+				extend(p0);
+				extend(p1);
+				extend(pI1);
+				extend(pI2);
+			}
+
+		} else {
+			// ONE point in front, TWO behind (mask has 2 bits set)
+			// This creates a single smaller triangle
+			vec3 I1 = intersectNear(v_view[0], v_view[1]);
+			vec3 I2 = intersectNear(v_view[0], v_view[2]);
+
+			if constexpr(USE_SUTHERLAND){
+				Stage2PlaneClipping::windowClipping(
+					viewToNDC(v_view[0], f, aspect),
+					viewToNDC(I1, f, aspect),
+					viewToNDC(I2, f, aspect),
+					&boxMin, &boxMax
+				);
+			}else{
+				extend(viewToNDC(v_view[0], f, aspect));
+				extend(	viewToNDC(I1, f, aspect));
+				extend(	viewToNDC(I2, f, aspect));
+			}
+		}
+	}
+
+	// clamp to ndc space
+	boxMin.x = clamp(boxMin.x, -1.0f, 1.0f);
+	boxMax.x = clamp(boxMax.x, -1.0f, 1.0f);
+	boxMin.y = clamp(boxMin.y, -1.0f, 1.0f);
+	boxMax.y = clamp(boxMax.y, -1.0f, 1.0f);
+
+	// to screen-space coordinates
+	float halfW = width * 0.5f;
+	float halfH = height * 0.5f;
+	*min_x = boxMin.x * halfW + halfW;
+	*min_y = boxMin.y * halfH + halfH;
+	*max_x = boxMax.x * halfW + halfW;
+	*max_y = boxMax.y * halfH + halfH;
+}
+
+
+#include "./stage1_heavy_defer.cuh"
+
+// CONSUME_DEFERRED: after the medium queue is exhausted, each warp
+// rasterizes heavy small triangles deferred by Stage 1.
+template<IndexFetch INDEXING, Compression COMPRESSION, bool CONSUME_DEFERRED = false>
 void stage2_drawMediumTriangles(RasterArgs& args) {
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -438,7 +650,10 @@ void stage2_drawMediumTriangles(RasterArgs& args) {
 		}
 		nontrivialTriangleIndex = warp.shfl(nontrivialTriangleIndex, 0);
 
-		if (nontrivialTriangleIndex >= *args.nontrivialTrianglesCounter) return;
+		if (nontrivialTriangleIndex >= *args.nontrivialTrianglesCounter){
+			if constexpr (CONSUME_DEFERRED) heavydefer::rasterizeDeferred(args);
+			return;
+		}
 
 		// Warp-Level Triangle Setup (Thread 0 does the heavy lifting)
 		// We use local variables that we will shuffle to other threads later
@@ -478,7 +693,7 @@ void stage2_drawMediumTriangles(RasterArgs& args) {
 			vec3 b_view = vec3(worldView * vec4(b, 1.0f));
 			vec3 c_view = vec3(worldView * vec4(c, 1.0f));
 
-			computeScreenSpaceBoundingBox(
+			stage2_computeBounds(
 				a_ndc, b_ndc, c_ndc, a_view, b_view, c_view,
 				worldView, f, aspect, args.target.width, args.target.height,
 				&min_x, &max_x, &min_y, &max_y
@@ -582,7 +797,10 @@ void stage2_drawMediumTriangles(RasterArgs& args) {
 
 			if (s >= 0.0f && t >= 0.0f && v >= 0.0f) {
 				int pixelID = toFramebufferIndex((int)px, (int)py, args.target.width);
-				if (pixelID < args.target.width * args.target.height) {
+				// The half-pixel bounding-box margin can reach x = -1 / width and y = -1. Without a full
+				// x/y check those samples wrapped into the neighbouring row or wrote before the buffer.
+				bool inside = px >= 0.0f && py >= 0.0f && (int)px < args.target.width && (int)py < args.target.height;
+				if (inside) {
 
 					// float depth = v * a_ndc.z + s * b_ndc.z + t * c_ndc.z;
 					// perspective-correct interpolation
@@ -601,8 +819,11 @@ void stage2_drawMediumTriangles(RasterArgs& args) {
 
 
 
-template<IndexFetch INDEXING, Compression COMPRESSION>
+// ROW_SLICES > 1 splits each 64-row tile into independent row-range jobs; every pixel's ray test is unchanged.
+template<IndexFetch INDEXING, Compression COMPRESSION, int ROW_SLICES = 1>
 void stage3_drawHugeTriangles(RasterArgs args){
+	static_assert(64 % ROW_SLICES == 0);
+	constexpr int ROWS_PER_JOB = 64 / ROW_SLICES;
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
 
@@ -621,15 +842,18 @@ void stage3_drawHugeTriangles(RasterArgs args){
 
 	while(true){
 
+		// Protect hugeTriIndex from reuse while another warp reads the old claim.
+		block.sync();
 		if(block.thread_rank() == 0){
 			hugeTriIndex = atomicAdd(args.numProcessedHugeTriangles, 1);
 		}
 
 		block.sync();
 
-		if(hugeTriIndex >= *args.hugeTrianglesCounter) return;
+		if(hugeTriIndex >= *args.hugeTrianglesCounter * ROW_SLICES) return;
 
-		HugeTriangle tri = args.hugeTriangles[hugeTriIndex];
+		uint32_t rowSlice = hugeTriIndex % ROW_SLICES;
+		HugeTriangle tri = args.hugeTriangles[hugeTriIndex / ROW_SLICES];
 		CMesh mesh = args.instances[tri.meshIndex];
 		mat4 transform = args.target.proj * args.target.view * mesh.world;
 		// mat4 worldView = target.view * mesh.world;
@@ -716,7 +940,7 @@ void stage3_drawHugeTriangles(RasterArgs args){
 
 		#elif defined(RAYTRACE)
 
-		for(int y = 0; y < 64; y++){
+		for(int y = rowSlice * ROWS_PER_JOB; y < (rowSlice + 1) * ROWS_PER_JOB; y++){
 			int fragX = block.thread_rank();
 			int fragY = y;
 			
@@ -799,8 +1023,18 @@ void kernel_stage2_drawMediumTriangles_indexbuffer_uncompressed(RasterArgs args)
 }
 
 extern "C" __global__
+void kernel_stage2_drawMediumTriangles_indexbuffer_uncompressed_deferred(RasterArgs args) {
+	stage2_drawMediumTriangles<IndexFetch::INDEXBUFFER, Compression::UNCOMPRESSED, true>(args);
+}
+
+extern "C" __global__
 void kernel_stage3_drawHugeTriangles_indexbuffer_uncompressed(RasterArgs args) {
 	stage3_drawHugeTriangles<IndexFetch::INDEXBUFFER, Compression::UNCOMPRESSED>(args);
+}
+
+extern "C" __global__
+void kernel_stage3_drawHugeTriangles_indexbuffer_uncompressed_rows16(RasterArgs args) {
+	stage3_drawHugeTriangles<IndexFetch::INDEXBUFFER, Compression::UNCOMPRESSED, 16>(args);
 }
 
 
@@ -862,6 +1096,11 @@ void kernel_stage3_drawHugeTriangles_noindexbuffer_compressed(RasterArgs args) {
 extern "C" __global__
 void kernel_stage1_drawSmallTriangles_indexbuffer_uncompressed_instanced(RasterArgs args){
 	stage1_drawSmallTriangles<IndexFetch::INDEXBUFFER, Compression::UNCOMPRESSED, Instancing::YES>(args);
+}
+
+extern "C" __global__ __maxnreg__(56)
+void kernel_stage1_drawSmallTriangles_indexbuffer_uncompressed_instanced_128_defer48(RasterArgs args){
+	heavydefer::stage1(args);
 }
 
 // INDEXBUFFER; COMPRESSED; INSTANCED

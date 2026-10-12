@@ -290,6 +290,7 @@ struct RasterizationSettings{
 	bool showWireframe;
 	bool enableDiffuseLighting;
 	bool enableObjectPicking;
+	bool preserveColorbufferDepth;
 	DisplayAttribute displayAttribute;
 };
 
@@ -310,8 +311,10 @@ enum class Instancing{NO, YES};
 struct RasterArgs{
 	CMesh* meshes;
 	uint32_t numMeshes;
+	uint32_t* meshNumTriangles;
 	CMesh* instances;
 	uint32_t numInstances;
+	uint32_t* instanceNumTriangles;
 	mat4* transforms;
 	uint32_t* numProcessedBatches;
 	uint32_t* numProcessedBatches_nontrivial;
@@ -321,6 +324,9 @@ struct RasterArgs{
 	uint32_t* nontrivialTrianglesCounter;
 	uint64_t* nontrivialTrianglesList;
 	RenderTarget target;
+	uint32_t* deferredCounter;   // heavy small triangles deferred by Stage 1
+	uint64_t* deferredList;
+	uint32_t* deferredProcessed; // claims of deferred triangles by Stage 2
 };
 
 extern __constant__ RenderTarget c_target;

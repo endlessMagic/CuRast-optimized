@@ -35,9 +35,11 @@ struct CURuntime{
 	}
 
 
-	static void assertCudaSuccess(CUresult result, std::stacktrace trace = std::stacktrace::current()){
+	static void assertCudaSuccess(CUresult result, std::stacktrace trace = {}){
 
 		if(result == CUDA_SUCCESS) return;
+		// Avoid collecting a stack trace between a successful launch and its end event.
+		if(trace.empty()) trace = std::stacktrace::current();
 
 		println("ERROR: CUDA result != CUDA_SUCCESS.");
 

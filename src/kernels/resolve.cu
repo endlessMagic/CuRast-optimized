@@ -144,6 +144,7 @@ uint32_t sampleColor_nearest(
 	return color;
 }
 
+template<bool BoundedWrap = false>
 __device__
 uint32_t sampleColor_linear(
 	uint32_t* textureData,
@@ -166,12 +167,20 @@ uint32_t sampleColor_linear(
 	float fty = (uv.y - floor(uv.y)) * float(height);
 
 	auto getTexel = [&](float ftx, float fty) -> vec4 {
-		int tx = fmodf(ftx, float(width));
-		int ty = fmodf(fty, float(height));
+		int tx, ty;
+		if constexpr(BoundedWrap){
+			// Fractional UVs bound these coordinates to [-0.5, extent + 0.5].
+			// Keep truncation toward zero at the negative edge, as with fmodf.
+			tx = int(ftx >= float(width) ? ftx - float(width) : ftx);
+			ty = int(fty >= float(height) ? fty - float(height) : fty);
+		}else{
+			tx = fmodf(ftx, float(width));
+			ty = fmodf(fty, float(height));
+		}
 		int texelID = tx + ty * width;
 		texelID = clamp(texelID, 0, width * height - 1);
 
-		uint32_t texel = textureData[texelID];
+		uint32_t texel = __ldg(&textureData[texelID]);
 		uint8_t* rgba = (uint8_t*)&texel;
 
 		return vec4{rgba[0], rgba[1], rgba[2], rgba[3]};
@@ -227,13 +236,19 @@ void kernel_clearFramebuffer(
 	// uint64_t pixel = udepth << 40;
 	uint64_t pixel = 0xFFFFFFF0'00000000ULL;
 	framebuffer[pixelID] = pixel;
-
-	framebuffer[pixelID] = pixel;
 }
 
 
+// FromVisbuffer: read neighbor depth from the packed visibility buffer instead of the colorbuffer.
+// Without preserved colorbuffer depth, both hold the same depth for every pixel.
+// InteriorOffsets (distance 1 only): integer neighbor offsets equal to the folded int(x + cos(u)) /
+// int(y + sin(u)) truncations for 1 <= x < 4096, y >= 1 and all neighbors inside the target.
+// Sample 1 truncates to the pixel itself; samples 3/4 and 5/6 hit the same neighbor.
+template<bool FromVisbuffer = false, bool InteriorOffsets = false>
 __device__
 float getEdlShadingFactor(uint64_t* colorbuffer, float depth, int x, int y, int distance){
+	static_assert(!InteriorOffsets || FromVisbuffer);
+
 	auto getNeighborDepth = [&](int x, int y) -> float{
 
 		if(x < 0 || x >= c_target.width) return Infinity;
@@ -242,7 +257,13 @@ float getEdlShadingFactor(uint64_t* colorbuffer, float depth, int x, int y, int 
 		int pixelID = toFramebufferIndex(x, y, c_target.width);
 		uint64_t pixel = colorbuffer[pixelID];
 
-		float d = __uint_as_float(pixel >> 32);
+		float d;
+		if constexpr(FromVisbuffer){
+			uint64_t triangleIndex;
+			unpack_pixel(pixel, &d, &triangleIndex);
+		}else{
+			d = __uint_as_float(pixel >> 32);
+		}
 
 		return d;
 	};
@@ -250,11 +271,25 @@ float getEdlShadingFactor(uint64_t* colorbuffer, float depth, int x, int y, int 
 	float sum = 0.0f;
 	int numSamples = 8;
 	for(int i = 0; i < numSamples; i++){
-		float u = 2.0f * 3.1415f * float(i) / float(numSamples);
-		float dx = float(distance) * cos(u);
-		float dy = float(distance) * sin(u);
-		
-		sum += max(log2f(depth) - log2f(getNeighborDepth(x + dx, y + dy)), 0.0f);
+		if constexpr(InteriorOffsets){
+			constexpr int offsetsX[8] = {1, 0, 0, -1, -1, -1, -1,  0};
+			constexpr int offsetsY[8] = {0, 0, 1,  0,  0, -1, -1, -1};
+
+			float neighborDepth = depth;
+			if(i != 1){
+				uint64_t pixel = colorbuffer[toFramebufferIndex(x + offsetsX[i], y + offsetsY[i], c_target.width)];
+				uint64_t triangleIndex;
+				unpack_pixel(pixel, &neighborDepth, &triangleIndex);
+			}
+
+			sum += max(log2f(depth) - log2f(neighborDepth), 0.0f);
+		}else{
+			float u = 2.0f * 3.1415f * float(i) / float(numSamples);
+			float dx = float(distance) * cos(u);
+			float dy = float(distance) * sin(u);
+
+			sum += max(log2f(depth) - log2f(getNeighborDepth(x + dx, y + dy)), 0.0f);
+		}
 	}
 
 	// float response = sum / 4.0f;
@@ -637,8 +672,12 @@ void kernel_ssaoBlur(
 }
 
 
-extern "C" __global__
-void kernel_resolve_visbuffer_to_colorbuffer2D(
+// ToSurface: also apply the same-size output conversion of kernel_resolve_colorbuffer_to_opengl_2D
+// (EDL from visbuffer depth, no SSAO) and write the surface instead of the colorbuffer.
+// Tuned: launch coordinates instead of pixelID % / width, bounded texel wrap and
+// closed-form mip offset; the kernel entry also caps registers at 64 (8 blocks per SM).
+template<bool TextureFastPath, bool ToSurface = false, bool EdlInteriorOffsets = false, bool Tuned = false>
+__device__ void resolve_visbuffer_pixel_to_colorbuffer(
 	CMesh* meshes,
 	uint32_t numMeshes,
 	uint64_t* triangleCountPrefixSum,
@@ -646,84 +685,65 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 	int mouseY,
 	DeviceState* state,
 	RasterizationSettings rasterizationSettings,
-	JpegPipeline jpp
+	JpegPipeline jpp,
+	int pixelID,
+	uint64_t pixel,
+	cudaSurfaceObject_t surface = 0,
+	bool enableEDL = false,
+	uint32_t backgroundColor = 0,
+	int launchX = 0,
+	int launchY = 0
 ) {
-	auto grid = cg::this_grid();
-	auto block = cg::this_thread_block();
-
-	int x = grid.thread_index().x;
-	int y = grid.thread_index().y;
-	// int pixelID = x + c_target.width * y;
-	int pixelID = toFramebufferIndex(x, y, c_target.width);
-
-	if(x >= c_target.width) return;
-	if(y >= c_target.height) return;
-
-	auto computeRayDir = [](float x, float y, float width, float height, mat4 view, mat4 proj){
-		float u = 2.0f * x / width - 1.0f;
-		float v = 2.0f * y / height - 1.0f;
-
-		mat4 viewI = inverse(view);
-		vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
-		vec3 rayDir_view = normalize(vec3{
-			1.0f / proj[0][0] * u,
-			1.0f / proj[1][1] * v,
-			-1.0f
-		});
-		vec3 rayDir_world = normalize(vec3(viewI * vec4(rayDir_view, 1.0f)) - origin);
-
-		return rayDir_world;
-	};
-
-	mat4 viewI = inverse(c_target.view);
-	vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
-	vec3 rayDir    = computeRayDir(float(x) + 0.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_10 = computeRayDir(float(x) + 1.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_01 = computeRayDir(float(x) + 0.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-	vec3 rayDir_11 = computeRayDir(float(x) + 1.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
-
-	uint64_t pixel = c_target.framebuffer[pixelID];
-	uint64_t pixel_colorbuffer = c_target.colorbuffer[pixelID];
+	int x, y;
+	if constexpr(Tuned){
+		x = launchX;
+		y = launchY;
+	}else{
+		x = pixelID % c_target.width;
+		y = pixelID / c_target.width;
+	}
 	
 	float depth;
-	uint32_t meshIndex;
 	uint64_t totalTriangleIndex = 0;
 	unpack_pixel(pixel, &depth, &totalTriangleIndex);
 
-	float depth_colorbuffer = __uint_as_float(pixel_colorbuffer >> 32);
-
-	if(depth_colorbuffer < depth) return;
-
-	{// Find mesh corresponding to totalTriangleIndex via binary search
-		int left = 0;
-		int right = numMeshes - 1;
-		int searchResult = 0;
-
-		while(left <= right){
-			int mid = left + (right - left) / 2;
-			
-			int64_t before = triangleCountPrefixSum[mid];
-			int64_t after = (mid == (numMeshes - 1)) ? 0xffffffffff : triangleCountPrefixSum[mid + 1];
-
-			if(totalTriangleIndex >= before && totalTriangleIndex < after){
-				searchResult = mid;
-				break;
-			}else if(after <= totalTriangleIndex){
-				left = mid + 1;
-			}else{
-				right = mid - 1;
-			}
-
-			if(mid == left) break;
-		}
-
-		meshIndex = searchResult;
+	if(rasterizationSettings.preserveColorbufferDepth){
+		uint64_t pixel_colorbuffer = c_target.colorbuffer[pixelID];
+		float depth_colorbuffer = __uint_as_float(pixel_colorbuffer >> 32);
+		if(depth_colorbuffer < depth) return;
 	}
 	
 	uint32_t color = 0;
 	uint8_t *rgb = (uint8_t *)&color;
 
 	if(!isinf(depth)){
+		uint32_t meshIndex;
+		{// Find mesh corresponding to totalTriangleIndex via binary search
+			int left = 0;
+			int right = numMeshes - 1;
+			int searchResult = 0;
+
+			while(left <= right){
+				int mid = left + (right - left) / 2;
+				
+				int64_t before = triangleCountPrefixSum[mid];
+				int64_t after = (mid == (numMeshes - 1)) ? 0xffffffffff : triangleCountPrefixSum[mid + 1];
+
+				if(totalTriangleIndex >= before && totalTriangleIndex < after){
+					searchResult = mid;
+					break;
+				}else if(after <= totalTriangleIndex){
+					left = mid + 1;
+				}else{
+					right = mid - 1;
+				}
+
+				if(mid == left) break;
+			}
+
+			meshIndex = searchResult;
+		}
+
 		CMesh mesh = meshes[meshIndex];
 		uint32_t triangleIndex = totalTriangleIndex - mesh.cummulativeTriangleCount;
 
@@ -739,6 +759,10 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			goto shade_finished;
 		}
 
+        if constexpr(TextureFastPath){
+            if(!mesh.uvs){color=0xffff00ff;goto shade_finished;}
+        }
+
 		// resolve indices first
 		uint32_t i0, i1, i2;
 		if(!mesh.compressed){
@@ -752,8 +776,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				i2 = 3 * triangleIndex + 2;
 			}
 		}else{
-			uint32_t indexRange = mesh.index_max - mesh.index_min;
-			uint64_t bitsPerIndex = ceil(log2f(float(indexRange + 1)));
+			uint32_t bitsPerIndex = mesh.bitsPerIndex;
 			i0 = BitEdit::readU32(mesh.indices, bitsPerIndex * (3 * triangleIndex + 0), bitsPerIndex) + mesh.index_min;
 			i1 = BitEdit::readU32(mesh.indices, bitsPerIndex * (3 * triangleIndex + 1), bitsPerIndex) + mesh.index_min;
 			i2 = BitEdit::readU32(mesh.indices, bitsPerIndex * (3 * triangleIndex + 2), bitsPerIndex) + mesh.index_min;
@@ -766,20 +789,42 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 		vec2 uv_a = getUV_resolved(mesh, i0);
 		vec2 uv_b = getUV_resolved(mesh, i1);
 		vec2 uv_c = getUV_resolved(mesh, i2);
-		// ---------------------------------------------------
 
-
+		// Finish object-space positions before setting up the four camera rays.
 		// mat4 worldView = c_target.view * mesh.world;
 		vec3 a_world = mesh.world * vec4(a_object, 1.0f);
 		vec3 b_world = mesh.world * vec4(b_object, 1.0f);
 		vec3 c_world = mesh.world * vec4(c_object, 1.0f);
 
-		vec3 a_view = c_target.view * vec4(a_world, 1.0f);
-		vec3 b_view = c_target.view * vec4(b_world, 1.0f);
-		vec3 c_view = c_target.view * vec4(c_world, 1.0f);
+		// Schedule independent ray setup after issuing this pixel's geometry fetches.
+		auto computeRayDir = [](float x, float y, float width, float height, mat4 view, mat4 proj){
+			float u = 2.0f * x / width - 1.0f;
+			float v = 2.0f * y / height - 1.0f;
 
-		vec3 N = normalize(cross(b_view - a_view, c_view - a_view));
-		
+			mat4 viewI = inverse(view);
+			vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
+			vec3 rayDir_view = normalize(vec3{
+				1.0f / proj[0][0] * u,
+				1.0f / proj[1][1] * v,
+				-1.0f
+			});
+			vec3 rayDir_world = normalize(vec3(viewI * vec4(rayDir_view, 1.0f)) - origin);
+
+			return rayDir_world;
+		};
+
+		mat4 viewI = inverse(c_target.view);
+		vec3 origin = viewI * vec4(0.0f, 0.0f, 0.0f, 1.0f);
+		vec3 rayDir    = computeRayDir(float(x) + 0.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
+		vec3 rayDir_10 = computeRayDir(float(x) + 1.5f, float(y) + 0.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
+		vec3 rayDir_01 = computeRayDir(float(x) + 0.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
+		vec3 rayDir_11 = computeRayDir(float(x) + 1.5f, float(y) + 1.5f, c_target.width, c_target.height, c_target.view, c_target.proj);
+
+		// ---------------------------------------------------
+
+
+
+
 		// For mip map level:
 		// - Find triangle intersection in current pixel for current uv
 		// - Also find triangle intersection for pixels to the right and the top to 
@@ -847,11 +892,22 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			min(min(uv.y, uv_10.y), min(uv_01.y, uv_11.y)),
 		};
 
+        // Read the immutable instance descriptor near texture use.
+        uint32_t textureWidth = mesh.texture.width;
+        uint32_t textureHeight = mesh.texture.height;
+        uint32_t* textureData = mesh.texture.data;
+        if constexpr(TextureFastPath){
+            const volatile Texture* lateTexture = &meshes[meshIndex].texture;
+            textureWidth = lateTexture->width;
+            textureHeight = lateTexture->height;
+            textureData = lateTexture->data;
+        }
+
 		// Compute Mip Map level by delta of texcoords
 		uv.x = uv.x - floor(uv.x);
 		uv.y = uv.y - floor(uv.y);
-		vec2 dx = (uvmax.x - uvmin.x) * vec2{mesh.texture.width, mesh.texture.height};
-		vec2 dy = (uvmax.y - uvmin.y) * vec2{mesh.texture.width, mesh.texture.height};
+		vec2 dx = (uvmax.x - uvmin.x) * vec2{textureWidth, textureHeight};
+		vec2 dy = (uvmax.y - uvmin.y) * vec2{textureWidth, textureHeight};
 		float mipLevel = 0.5f * log2(max(dot(dx, dx), dot(dy, dy)));
 		mipLevel = int(mipLevel);
 		mipLevel = min(mipLevel, 7.0f);
@@ -859,19 +915,44 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 		// pick a mip map level
 		int target_level = clamp(mipLevel, 0.0f, 7.0f);
 		// target_level = 0;
-		uint32_t* data = mesh.texture.data;
-		uint32_t width = mesh.texture.width;
-		uint32_t height = mesh.texture.height;
-		for(int i = 1; i <= target_level; i++){
-			data = data + width * height;
-			width = (width + 2 - 1) / 2;
-			height = (height + 2 - 1) / 2;
+		uint32_t* data = textureData;
+		uint32_t width = textureWidth;
+		uint32_t height = textureHeight;
+		if constexpr(Tuned){
+			// Exact geometric sum while both power-of-two extents still halve.
+			// The 32768 bound keeps 4*(area-remainingArea) within uint32_t.
+			if(width <= 32768 && height <= 32768
+				&& (width & (width - 1)) == 0 && (height & (height - 1)) == 0
+				&& (width >> target_level) > 0 && (height >> target_level) > 0){
+				uint32_t area = width * height;
+				data += (4u * (area - (area >> (2 * target_level)))) / 3u;
+				width >>= target_level;
+				height >>= target_level;
+			}else{
+				for(int i = 1; i <= target_level; i++){
+					data = data + width * height;
+					width = (width + 2 - 1) / 2;
+					height = (height + 2 - 1) / 2;
+				}
+			}
+		}else{
+			for(int i = 1; i <= target_level; i++){
+				data = data + width * height;
+				width = (width + 2 - 1) / 2;
+				height = (height + 2 - 1) / 2;
+			}
 		}
 		color = 0xffff00ff;
 		
 		// TODO: These blocks here are a major performance bottleneck. 
 		// Removing them cuts registers from 88 to 56 and improves perf from 1.3ms to 0.88ms
-		if(rasterizationSettings.displayAttribute == DisplayAttribute::NONE){
+		if constexpr(TextureFastPath){
+			if(mesh.uvs){
+				color = sampleColor_linear<Tuned>(data, width, height, uv);
+			}else{
+				color = 0xff0000ff;
+			}
+		}else if(rasterizationSettings.displayAttribute == DisplayAttribute::NONE){
 			color = 0xffffffff;
 		}else if(rasterizationSettings.displayAttribute == DisplayAttribute::TRIANGLE_ID){
 			color = triangleIndex * 12345678;
@@ -974,6 +1055,10 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 		}else if(rasterizationSettings.displayAttribute == DisplayAttribute::STAGE){
 			// We don't actually know which stage a pixel was rasterized by, 
 			// but we can assume based on the triangle's size and whether it intersects the near plane.
+			vec3 a_view = c_target.view * vec4(a_world, 1.0f);
+			vec3 b_view = c_target.view * vec4(b_world, 1.0f);
+			vec3 c_view = c_target.view * vec4(c_world, 1.0f);
+
 			float f = c_target.proj[1][1];
 			float aspect = float(c_target.width) / float(c_target.height);
 
@@ -1034,6 +1119,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 		}
 		color = color | 0xff000000;
 
+		if constexpr(!TextureFastPath){
 		if(rasterizationSettings.enableDiffuseLighting && mesh.normals){
 
 			vec3 n0 = mesh.normals[i0];
@@ -1055,8 +1141,10 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			rgb[1] = clamp((d * diffuse.y + ambient.y) * float(rgb[1]), 0.0f, 255.0f);
 			rgb[2] = clamp((d * diffuse.z + ambient.z) * float(rgb[2]), 0.0f, 255.0f);
 		}
+		}
 
 		// Highlight hovered mesh: draw borders
+		if constexpr(!TextureFastPath){
 		if(rasterizationSettings.enableObjectPicking && mesh.id == state->hovered_meshId){
 
 			bool isInside = true;
@@ -1084,6 +1172,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 				color = 0xff0000ff;
 			}
 		}
+		}
 	}else{
 		color = 0;
 		// rgb[0] = 0.1f * 256.0f;
@@ -1099,6 +1188,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 	shade_finished:
 
 	// WIREFRAME
+	if constexpr(!TextureFastPath){
 	if(rasterizationSettings.showWireframe){
 		uint32_t numPixels = c_target.width * c_target.height;
 		int pid_00 = clamp(toFramebufferIndex(x + 0, y + 0, c_target.width), 0u, numPixels - 1);
@@ -1123,6 +1213,7 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 			if(p_00 != p_neighbor) color = 0xffff00ff;
 		}
 	}
+	}
 
 	// 64x64 tile grid
 	// if(x % 64 == 0 || y % 64 == 0){
@@ -1131,13 +1222,190 @@ void kernel_resolve_visbuffer_to_colorbuffer2D(
 
 	
 
-	if(depth != Infinity){
-		uint64_t udepth = __float_as_uint(depth);
-		uint64_t pixel = (udepth << 32) | color;
-		c_target.colorbuffer[pixelID] = pixel;
+	if constexpr(ToSurface){
+		float edl = 1.0f;
+		float ssao = 1.0f;
+
+		if(enableEDL){
+			bool interior = x >= 1 && y >= 1 && x < 4096 && x + 1 < c_target.width && y + 1 < c_target.height;
+			if(EdlInteriorOffsets && interior){
+				edl = getEdlShadingFactor<true, true>(c_target.framebuffer, depth, x, y, 1);
+			}else{
+				edl = getEdlShadingFactor<true>(c_target.framebuffer, depth, x, y, 1);
+			}
+		}
+
+		if(isinf(depth)) color = backgroundColor;
+
+		float shade = edl * ssao;
+		uint8_t* rgba = (uint8_t*)&color;
+		rgba[0] = shade * float(rgba[0]);
+		rgba[1] = shade * float(rgba[1]);
+		rgba[2] = shade * float(rgba[2]);
+
+		surf2Dwrite(color, surface, x * 4, y);
 	}else{
-		c_target.colorbuffer[pixelID] = uint64_t(__float_as_uint(INFINITY)) << 32 | 0;
+		if(depth != Infinity){
+			uint64_t udepth = __float_as_uint(depth);
+			uint64_t pixel = (udepth << 32) | color;
+			c_target.colorbuffer[pixelID] = pixel;
+		}else{
+			c_target.colorbuffer[pixelID] = uint64_t(__float_as_uint(INFINITY)) << 32 | 0;
+		}
 	}
+}
+
+extern "C" __global__
+void kernel_resolve_visbuffer_to_colorbuffer2D(
+	CMesh* meshes,
+	uint32_t numMeshes,
+	uint64_t* triangleCountPrefixSum,
+	int mouseX,
+	int mouseY,
+	DeviceState* state,
+	RasterizationSettings rasterizationSettings,
+	JpegPipeline jpp
+) {
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if(x >= c_target.width) return;
+	if(y >= c_target.height) return;
+
+	int pixelID = toFramebufferIndex(x, y, c_target.width);
+	uint64_t pixel = c_target.framebuffer[pixelID];
+
+	resolve_visbuffer_pixel_to_colorbuffer<false>(
+		meshes,
+		numMeshes,
+		triangleCountPrefixSum,
+		mouseX,
+		mouseY,
+		state,
+		rasterizationSettings,
+		jpp,
+		pixelID,
+		pixel
+	);
+}
+
+extern "C" __global__
+void kernel_resolve_visbuffer_to_colorbuffer2D_texture_fast(
+	CMesh* meshes,
+	uint32_t numMeshes,
+	uint64_t* triangleCountPrefixSum,
+	int mouseX,
+	int mouseY,
+	DeviceState* state,
+	RasterizationSettings rasterizationSettings,
+	JpegPipeline jpp
+) {
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if(x >= c_target.width) return;
+	if(y >= c_target.height) return;
+
+	int pixelID = toFramebufferIndex(x, y, c_target.width);
+	uint64_t pixel = c_target.framebuffer[pixelID];
+
+	resolve_visbuffer_pixel_to_colorbuffer<true>(
+		meshes,
+		numMeshes,
+		triangleCountPrefixSum,
+		mouseX,
+		mouseY,
+		state,
+		rasterizationSettings,
+		jpp,
+		pixelID,
+		pixel
+	);
+}
+
+// Texture-fast resolve fused with the same-size output conversion; skips the colorbuffer.
+// ClearNext: also write the cleared visbuffer value into the other (next frame's) framebuffer.
+template<bool EdlInteriorOffsets, bool ClearNext = false, bool Tuned = false>
+__device__ void resolve_visbuffer_to_surface2D_texture_fast(
+	CMesh* meshes,
+	uint32_t numMeshes,
+	uint64_t* triangleCountPrefixSum,
+	int mouseX,
+	int mouseY,
+	DeviceState* state,
+	RasterizationSettings rasterizationSettings,
+	JpegPipeline jpp,
+	cudaSurfaceObject_t surface,
+	bool enableEDL,
+	uint32_t backgroundColor,
+	uint64_t* nextFramebuffer = nullptr
+) {
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if(x >= c_target.width) return;
+	if(y >= c_target.height) return;
+
+	int pixelID = toFramebufferIndex(x, y, c_target.width);
+	uint64_t pixel = c_target.framebuffer[pixelID];
+
+	// Same value as kernel_clearFramebuffer.
+	if constexpr (ClearNext) nextFramebuffer[pixelID] = 0xFFFFFFF0'00000000ULL;
+
+	resolve_visbuffer_pixel_to_colorbuffer<true, true, EdlInteriorOffsets, Tuned>(
+		meshes,
+		numMeshes,
+		triangleCountPrefixSum,
+		mouseX,
+		mouseY,
+		state,
+		rasterizationSettings,
+		jpp,
+		pixelID,
+		pixel,
+		surface,
+		enableEDL,
+		backgroundColor,
+		x,
+		y
+	);
+}
+
+// Fused shading, eye-dome lighting and surface output; clears the next frame's framebuffer. Capped at 64 registers.
+extern "C" __global__ __maxnreg__(64)
+void kernel_resolve_visbuffer_to_surface2D_texture_fast_edl_offsets_tuned_clearnext(
+	CMesh* meshes, uint32_t numMeshes, uint64_t* triangleCountPrefixSum, int mouseX, int mouseY, DeviceState* state,
+	RasterizationSettings rasterizationSettings, JpegPipeline jpp, cudaSurfaceObject_t surface, bool enableEDL, uint32_t backgroundColor,
+	uint64_t* nextFramebuffer
+) {
+	resolve_visbuffer_to_surface2D_texture_fast<true, true, true>(meshes, numMeshes, triangleCountPrefixSum, mouseX, mouseY, state,
+		rasterizationSettings, jpp, surface, enableEDL, backgroundColor, nextFramebuffer);
+}
+
+// Screenshot from the presented surface. The surface stores background pixels with alpha 0;
+// the colorbuffer screenshot uses alpha 255 there, so restore it from visbuffer depth.
+extern "C" __global__
+void kernel_resolve_surface_to_screenshot(
+	uint32_t* screenshot,
+	cudaSurfaceObject_t surface
+) {
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if(x >= c_target.width) return;
+	if(y >= c_target.height) return;
+
+	int pixelID = toFramebufferIndex(x, y, c_target.width);
+
+	float depth;
+	uint64_t triangleIndex;
+	unpack_pixel(c_target.framebuffer[pixelID], &depth, &triangleIndex);
+
+	uint32_t color;
+	surf2Dread(&color, surface, x * 4, y);
+	if(isinf(depth)) color = color | 0xff000000;
+
+	screenshot[pixelID] = color;
 }
 
 extern "C" __global__

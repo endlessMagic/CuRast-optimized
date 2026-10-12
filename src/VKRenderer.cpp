@@ -4,6 +4,8 @@
 #include "Timer.h"
 #include "CURuntime.h"
 #include "CuRastSettings.h"
+#include "BenchmarkRun.h"
+#include "CudaVulkanFrameSync.h"
 
 #include <filesystem>
 #include <print>
@@ -20,6 +22,7 @@ static void error_callback(int error, const char* description) {
 }
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+	if(BenchmarkRun::enabled) return;
 	if (key < 0 || key >= (int)Runtime::keyStates.size()) return;
 
 	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
@@ -33,6 +36,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 }
 
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
+	if(BenchmarkRun::enabled) return;
 	ImGuiIO& io = ImGui::GetIO();
 	if (io.WantCaptureMouse) return;
 
@@ -44,12 +48,14 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
 }
 
 static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
+	if(BenchmarkRun::enabled) return;
 	ImGuiIO& io = ImGui::GetIO();
 	if (io.WantCaptureMouse) return;
 	Runtime::mouseEvents.onMouseScroll(xoffset, yoffset);
 }
 
 static void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
+	if(BenchmarkRun::enabled) return;
 	ImGuiIO& io = ImGui::GetIO();
 	if (io.WantCaptureMouse) return;
 
@@ -337,12 +343,19 @@ void VKRenderer::init() {
 		exit(1);
 	}
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	if (headless) {
+		glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+	}
+	if (BenchmarkRun::enabled) {
+		glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+		glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+	}
 	// glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 
 	int numMonitors;
 	GLFWmonitor** monitors = glfwGetMonitors(&numMonitors);
 	const GLFWvidmode* mode = glfwGetVideoMode(monitors[0]);
-	window = glfwCreateWindow(1920, 1080, "Splat Editor", nullptr, nullptr);
+	window = glfwCreateWindow(BenchmarkRun::enabled ? BenchmarkRun::width : 1920, BenchmarkRun::enabled ? BenchmarkRun::height : 1080, "Splat Editor", nullptr, nullptr);
 	if (!window) {
 		glfwTerminate();
 		exit(1);
@@ -621,6 +634,7 @@ void VKRenderer::createLogicalDevice() {
 	vulkan12Features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	vulkan12Features.descriptorBindingVariableDescriptorCount  = VK_TRUE;
 	vulkan12Features.descriptorBindingPartiallyBound           = VK_TRUE;
+	vulkan12Features.timelineSemaphore                         = VK_TRUE;
 
 	VkPhysicalDeviceVulkan13Features vulkan13Features = {};
 	vulkan13Features.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -1105,6 +1119,7 @@ void VKRenderer::loop(
 	double start = now();
 	double tPrevious = start;
 	double tPreviousFPS = start;
+	int64_t deferredFrame = -1; // pipelined present: frame whose CUDA timings are still pending
 
 	while (!glfwWindowShouldClose(window)) {
 		// Timing
@@ -1124,6 +1139,8 @@ void VKRenderer::loop(
 		// Window size
 		int w, h;
 		glfwGetWindowSize(window, &w, &h);
+		if(BenchmarkRun::enabled) BenchmarkRun::require(w == BenchmarkRun::width && h == BenchmarkRun::height,
+			std::format("window dimensions changed: actual {}x{}, requested {}x{}", w, h, BenchmarkRun::width, BenchmarkRun::height));
 		if (w == 0 || h == 0) {
 			glfwPollEvents();
 			continue;
@@ -1132,7 +1149,7 @@ void VKRenderer::loop(
 		width = w;
 		height = h;
 
-		EventQueue::instance->process();
+		if(!BenchmarkRun::enabled) EventQueue::instance->process();
 
 		{ // Camera update
 			Runtime::controls->update();
@@ -1157,7 +1174,10 @@ void VKRenderer::loop(
 
 		render(); // CUDA kernels + kernel_resolve + ImGui::Render() (but not RenderDrawData)
 
-		auto recordings = Timer::resolve();
+		// Pipelined present: resolve the previous frame's CUDA timings; this frame's are still pending.
+		vector<Timer::Recording> recordings = Timer::resolveDeferred();
+		if (deferredFrame >= 0) BenchmarkRun::append(deferredFrame, recordings);
+		deferredFrame = frameCount;
 		for (auto recording : recordings) {
 			Runtime::timings.add(recording.label, recording.milliseconds);
 		}
@@ -1177,8 +1197,10 @@ void VKRenderer::loop(
 			imageAvailableSemaphores[currentFrame],
 			VK_NULL_HANDLE, &imageIndex);
 
+		if(BenchmarkRun::enabled) BenchmarkRun::require(acquireResult == VK_SUCCESS, "Vulkan swapchain acquisition failed or changed");
 		if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
 			recreateSwapchain();
+			CudaVulkanFrameSync::endIteration();
 			continue;
 		}
 
@@ -1199,6 +1221,29 @@ void VKRenderer::loop(
 		submit.pCommandBuffers      = &commandBuffers[currentFrame];
 		submit.signalSemaphoreCount = 1;
 		submit.pSignalSemaphores    = &renderFinishedSemaphores[imageIndex]; // per-image, not per-frame
+
+		// Pipelined present: wait for CUDA's image on the GPU and signal when the blit is done.
+		VkSemaphore timelineWaits[2]       = {imageAvailableSemaphores[currentFrame], CudaVulkanFrameSync::timeline};
+		VkPipelineStageFlags timelineStages[2] = {waitStage, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+		uint64_t timelineWaitValues[2]     = {0, CudaVulkanFrameSync::cudaSignalValue()};
+		VkSemaphore timelineSignals[2]     = {renderFinishedSemaphores[imageIndex], CudaVulkanFrameSync::timeline};
+		uint64_t timelineSignalValues[2]   = {0, CudaVulkanFrameSync::vulkanSignalValue()};
+		VkTimelineSemaphoreSubmitInfo timelineInfo = {};
+		if (CudaVulkanFrameSync::timeline != VK_NULL_HANDLE) {
+			uint32_t waits = CudaVulkanFrameSync::vulkanWaits() ? 2 : 1;
+			timelineInfo.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+			timelineInfo.waitSemaphoreValueCount   = waits;
+			timelineInfo.pWaitSemaphoreValues      = timelineWaitValues;
+			timelineInfo.signalSemaphoreValueCount = 2;
+			timelineInfo.pSignalSemaphoreValues    = timelineSignalValues;
+			submit.pNext                = &timelineInfo;
+			submit.waitSemaphoreCount   = waits;
+			submit.pWaitSemaphores      = timelineWaits;
+			submit.pWaitDstStageMask    = timelineStages;
+			submit.signalSemaphoreCount = 2;
+			submit.pSignalSemaphores    = timelineSignals;
+			CudaVulkanFrameSync::vulkanSignaled = true;
+		}
 		vkQueueSubmit(graphicsQueue, 1, &submit, inFlightFences[currentFrame]);
 
 		// Present
@@ -1210,10 +1255,12 @@ void VKRenderer::loop(
 		presentInfo.pSwapchains        = &swapchain;
 		presentInfo.pImageIndices      = &imageIndex;
 		VkResult presentResult = vkQueuePresentKHR(graphicsQueue, &presentInfo);
+		if(BenchmarkRun::enabled) BenchmarkRun::require(presentResult == VK_SUCCESS, "Vulkan presentation failed or changed");
 		if (presentResult == VK_ERROR_OUT_OF_DATE_KHR ||
 		    presentResult == VK_SUBOPTIMAL_KHR) {
 			recreateSwapchain();
 		}
+		CudaVulkanFrameSync::endIteration();
 
 		postFrame();
 		glfwPollEvents();
@@ -1223,7 +1270,15 @@ void VKRenderer::loop(
 		fpsCounter++;
 	}
 
+	// Pipelined present: the last frame's CUDA timings are still pending.
+	if (deferredFrame >= 0) {
+		auto recordings = Timer::resolveDeferred();
+		BenchmarkRun::append(deferredFrame, recordings);
+	}
+
 	vkDeviceWaitIdle(device);
+	cuCtxSynchronize();
+	CudaVulkanFrameSync::destroy();
 
 	// Explicitly destroy the CUDA-interop texture before device destruction.
 	if (view.framebuffer && view.framebuffer->colorAttachment) {

@@ -22,7 +22,7 @@ public:
         return bit;
     }
 
-	uint32_t advance(uint32_t numBits){
+	void advance(uint32_t numBits){
 
 		bit_offset += numBits;
 		byte_offset += bit_offset / 8;

@@ -159,6 +159,7 @@ struct VKRenderer {
 
 	inline static int         width          = 0;
 	inline static int         height         = 0;
+	inline static bool        headless       = false;
 
 	inline static std::vector<std::function<void(std::vector<std::string>)>> fileDropListeners;
 

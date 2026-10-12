@@ -33,6 +33,7 @@ inline PFN_vkCmdSetColorWriteMaskEXT      g_vkCmdSetColorWriteMaskEXT;
 // VK_KHR_external_memory_win32 / VK_KHR_external_memory_fd
 #ifdef _WIN32
 inline PFN_vkGetMemoryWin32HandleKHR      g_vkGetMemoryWin32HandleKHR;
+inline PFN_vkGetSemaphoreWin32HandleKHR   g_vkGetSemaphoreWin32HandleKHR;
 #else
 inline PFN_vkGetMemoryFdKHR               g_vkGetMemoryFdKHR;
 #endif
@@ -63,6 +64,7 @@ inline PFN_vkDestroyDebugUtilsMessengerEXT g_vkDestroyDebugUtilsMessengerEXT;
 
 #ifdef _WIN32
 #define vkGetMemoryWin32HandleKHR       g_vkGetMemoryWin32HandleKHR
+#define vkGetSemaphoreWin32HandleKHR    g_vkGetSemaphoreWin32HandleKHR
 #else
 #define vkGetMemoryFdKHR                g_vkGetMemoryFdKHR
 #endif
@@ -95,6 +97,7 @@ inline void loadVkExt(VkInstance instance, VkDevice device) {
 
 #ifdef _WIN32
     LOAD_DEV(vkGetMemoryWin32HandleKHR);
+    LOAD_DEV(vkGetSemaphoreWin32HandleKHR);
 #else
     LOAD_DEV(vkGetMemoryFdKHR);
 #endif

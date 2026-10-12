@@ -8,12 +8,15 @@
 #include <algorithm>
 #include <execution>
 #include <thread>
+#include <charconv>
+#include <limits>
 
 #include "unsuck.hpp"
 
 #include "cuda.h"
 #include "cuda_runtime.h"
 #include "CudaModularProgram.h"
+#include "CudaVulkanFrameSync.h"
 #include "CudaVulkanSharedMemory.h"
 #include "VulkanCudaSharedMemory.h"
 #include "jpeg/JPEGIndexer.h"
@@ -30,6 +33,9 @@
 #include "GLTFLoader.h"
 #include "LargeGlbLoader.h"
 #include "PlyLoader.h"
+#include "BenchmarkRun.h"
+
+
 
 using namespace std; // YOLO
 
@@ -49,6 +55,13 @@ void initCuda() {
 	cuCtxCreate(&context, &creation_params, 0, CURuntime::device);
 }
 
+std::string benchmarkAssetPath() {
+	return BenchmarkRun::fixture == "donaukanal" ? "resources/example_donaukanal_urania.glb" : "resources/hakone_1M.glb";
+}
+
+shared_ptr<largeGlb::LoadedGlb> loadFixtureAsset(const std::string& file) {
+	return largeGlb::load(file, context, {.skipUVs = false, .compress = false});
+}
 
 void initScene() {
 	CuRast* editor = CuRast::instance;
@@ -113,16 +126,46 @@ void initScene() {
 	auto loadHakone = [=](){
 		// string file = "./resources/meshes/donaukanal_urania_1M_jpeg80.glb";
 		// string file = "F:/resources/meshes/hakone_lantern.glb";
-		string file = "F:/resources/meshes/hakone_1M.glb";
+		string file = "./resources/hakone_1M.glb";
 
-		static auto glb = largeGlb::load(file, context, {.skipUVs = false, .compress = false});
+		static auto glb = loadFixtureAsset(file);
 		editor->scene.world->children.push_back(glb->glbNode);
+		if(BenchmarkRun::enabled && BenchmarkRun::fixture == "hakone-instances"){
+			BenchmarkRun::require(glb->glbNode->children.size() == 1, "Hakone instance fixture requires one mesh node");
+			auto original = dynamic_pointer_cast<SNTriangles>(glb->glbNode->children[0]);
+			BenchmarkRun::require(original && original->children.empty(), "Hakone instance fixture requires a flat mesh node");
+			// Three instances (one translated, one reflected) sharing the same geometry and texture.
+			const std::vector<mat4> transforms = {
+				mat4(1.0f),
+				glm::translate(vec3{0.5506777000427246f, 0.0f, 0.0f}),
+				glm::translate(vec3{49.109172668457035f, 0.0f, 0.0f}) * glm::scale(vec3{-1.0f, 1.0f, 1.0f})
+			};
+			glb->glbNode->children.clear();
+			for(const auto& transform : transforms){
+				auto instance = make_shared<SNTriangles>("benchmark instance");
+				instance->mesh = original->mesh;
+				instance->texture = original->texture;
+				instance->aabb = original->aabb;
+				instance->transform = transform;
+				glb->glbNode->children.push_back(instance);
+			}
+		}
 
 		// Overview
 		Runtime::controls->yaw    = -7.070;
 		Runtime::controls->pitch  = -0.515;
 		Runtime::controls->radius = 37.564;
 		Runtime::controls->target = { 25.607, -17.328, 8.340, };
+	};
+
+	auto loadBenchmarkDonaukanal = [=](){
+		static auto glb = loadFixtureAsset("./resources/example_donaukanal_urania.glb");
+		editor->scene.world->children.push_back(glb->glbNode);
+		// View the textured street/canal side above the coarse outer scan faces.
+		Runtime::controls->yaw    = -4.062407346410207;
+		Runtime::controls->pitch  = -0.9;
+		Runtime::controls->radius = 482.00092684918354;
+		Runtime::controls->target = { 36.32972717285156, 120.40862274169922, 29.570054054260254 };
 	};
 
 	auto loadHakoneInstances = [=](){
@@ -300,6 +343,12 @@ void initScene() {
 	// loadPolygraphenewerkLeibzigInstances();
 	// loadVenice();
 
+	// Benchmark fixtures (--benchmark-fixture hakone|hakone-instances|donaukanal).
+	if(BenchmarkRun::enabled){
+		if(BenchmarkRun::fixture == "donaukanal") loadBenchmarkDonaukanal();
+		else loadHakone();
+	}
+
 }
 
 void update(){
@@ -381,26 +430,151 @@ void update(){
 
 }
 
-int main(int argc, char** argv){
+void recordBenchmarkRuntime() {
+	CUdevice device;
+	Timer::checkCuda(cuCtxGetDevice(&device));
+	char name[256] = {};
+	Timer::checkCuda(cuDeviceGetName(name, sizeof(name), device));
+	CUuuid uuid;
+	Timer::checkCuda(cuDeviceGetUuid(&uuid, device));
+	std::string uuidText;
+	for(unsigned char byte : uuid.bytes) uuidText += std::format("{:02x}", byte);
+	int driver = 0, major = 0, minor = 0, rtcMajor = 0, rtcMinor = 0;
+	Timer::checkCuda(cuDriverGetVersion(&driver));
+	Timer::checkCuda(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+	Timer::checkCuda(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+	BenchmarkRun::require(nvrtcVersion(&rtcMajor, &rtcMinor) == NVRTC_SUCCESS, "cannot query NVRTC version");
+	unsigned int jitMajor = 0, jitMinor = 0;
+	BenchmarkRun::require(nvJitLinkVersion(&jitMajor, &jitMinor) == NVJITLINK_SUCCESS, "cannot query nvJitLink version");
+	BenchmarkRun::runtime["gpu_name"] = name;
+	BenchmarkRun::runtime["gpu_uuid"] = uuidText;
+	BenchmarkRun::runtime["driver_version"] = driver;
+	BenchmarkRun::runtime["compute_capability"] = {major, minor};
+	BenchmarkRun::runtime["nvrtc_version"] = {rtcMajor, rtcMinor};
+	BenchmarkRun::runtime["nvjitlink_version"] = {jitMajor, jitMinor};
+	BenchmarkRun::runtime["cuda_devrtlib"] = CUDA_DEVRTLIB;
+	const char* cache = std::getenv("CUDA_CACHE_DISABLE");
+	BenchmarkRun::runtime["cuda_cache_disable"] = cache ? nlohmann::json(cache) : nlohmann::json(nullptr);
+}
 
-	Benchmarking::datasetPath = "./";
+struct CommandLineOptions {
+	bool headless = false;
+	string output;
+	int nframes = 0;
+	bool benchmarkOptions = false;
+	bool benchmarkFixtureSet = false;
+	bool datasetOverride = false;
+};
 
-	for(int i = 1; i < argc - 1; i++){
-		if(string(argv[i]) == "-b"){
-			Benchmarking::datasetPath = argv[i + 1];
+void printUsage(char** argv) {
+	println("Usage: {} [-b datasetPath] [--headless] [--output path.png] [--nframes N] [--benchmark-output path.jsonl --benchmark-fixture hakone|hakone-instances|donaukanal --benchmark-warmup N --benchmark-frames N --benchmark-width N --benchmark-height N]", argv[0]);
+}
+
+CommandLineOptions parseCommandLine(int argc, char** argv) {
+	CommandLineOptions options;
+
+	for(int i = 1; i < argc; i++){
+		string arg = argv[i];
+		if(arg == "-b"){
+			if(i + 1 >= argc){
+				printUsage(argv);
+				exit(1);
+			}
+			Benchmarking::datasetPath = argv[++i];
+			options.datasetOverride = true;
+		}else if(arg == "--headless"){
+			options.headless = true;
+		}else if(arg == "--output"){
+			if(i + 1 >= argc){
+				printUsage(argv);
+				exit(1);
+			}
+			options.output = argv[++i];
+		}else if(arg == "--benchmark-output"){
+			BenchmarkRun::require(i + 1 < argc, "--benchmark-output requires a path");
+			BenchmarkRun::require(BenchmarkRun::outputPath.empty(), "duplicate --benchmark-output");
+			BenchmarkRun::outputPath = argv[++i];
+			BenchmarkRun::require(!BenchmarkRun::outputPath.empty(), "empty --benchmark-output");
+		}else if(arg == "--benchmark-fixture"){
+			BenchmarkRun::require(i + 1 < argc, "--benchmark-fixture requires a name");
+			BenchmarkRun::require(!options.benchmarkFixtureSet, "duplicate --benchmark-fixture");
+			BenchmarkRun::fixture = argv[++i];
+			BenchmarkRun::require(BenchmarkRun::fixture == "hakone" || BenchmarkRun::fixture == "hakone-instances" ||
+				BenchmarkRun::fixture == "donaukanal", "unknown benchmark fixture: " + BenchmarkRun::fixture);
+			options.benchmarkFixtureSet = true;
+			options.benchmarkOptions = true;
+		}else if(arg == "--benchmark-warmup" || arg == "--benchmark-frames" || arg == "--benchmark-width" || arg == "--benchmark-height"){
+			BenchmarkRun::require(i + 1 < argc, arg + " requires a positive integer");
+			string value = argv[++i];
+			int count = 0;
+			auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), count);
+			BenchmarkRun::require(ec == std::errc() && ptr == value.data() + value.size() && count > 0, arg + " requires a positive integer");
+			if(arg == "--benchmark-warmup") BenchmarkRun::warmupFrames = count;
+			if(arg == "--benchmark-frames") BenchmarkRun::measuredFrames = count;
+			if(arg == "--benchmark-width") BenchmarkRun::width = count;
+			if(arg == "--benchmark-height") BenchmarkRun::height = count;
+			options.benchmarkOptions = true;
+		}else if(arg == "--nframes"){
+			if(i + 1 >= argc){
+				printUsage(argv);
+				exit(1);
+			}
+
+			string value = argv[++i];
+			int nframes = 0;
+			auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), nframes);
+			if(ec != std::errc() || ptr != value.data() + value.size() || nframes <= 0){
+				println("--nframes requires a positive integer");
+				printUsage(argv);
+				exit(1);
+			}
+			options.nframes = nframes;
+		}else{
+			println("Unknown argument: {}", arg);
+			printUsage(argv);
+			exit(1);
 		}
 	}
 
+	BenchmarkRun::enabled = !BenchmarkRun::outputPath.empty();
+	BenchmarkRun::require(!options.benchmarkOptions || BenchmarkRun::enabled, "benchmark controls require --benchmark-output");
+	if(BenchmarkRun::enabled){
+		BenchmarkRun::require(options.headless, "--benchmark-output requires --headless");
+		BenchmarkRun::require(options.nframes == 0, "--nframes conflicts with benchmark frame counts");
+		BenchmarkRun::require(!options.datasetOverride, "benchmark fixtures do not use -b dataset selection");
+		BenchmarkRun::require(int64_t(BenchmarkRun::warmupFrames) + BenchmarkRun::measuredFrames <= std::numeric_limits<int>::max(), "frame count overflow");
+		BenchmarkRun::require(BenchmarkRun::width <= 4096 && BenchmarkRun::height <= 4096, "benchmark dimensions exceed 4096");
+		BenchmarkRun::require(options.output != BenchmarkRun::outputPath, "screenshot and raw output paths must differ");
+	}
+	return options;
+}
+
+int main(int argc, char** argv){
+	BenchmarkRun::processStart = std::chrono::steady_clock::now();
+
+	// With the CUDA cache enabled, nvJitLink can crash intermittently while the kernels are linked at start-up.
+	// Disable the cache unless the user set CUDA_CACHE_DISABLE explicitly. This must run before CUDA is used;
+	// _putenv_s also updates the process environment that the CUDA libraries read.
+	if(std::getenv("CUDA_CACHE_DISABLE") == nullptr){
+		_putenv_s("CUDA_CACHE_DISABLE", "1");
+	}
+	try {
+
+	Benchmarking::datasetPath = "./";
+
+	CommandLineOptions options = parseCommandLine(argc, argv);
+	if(BenchmarkRun::enabled) CudaModularProgram::watchSourceFiles = false;
 	std::locale::global(getSaneLocale());
 
 	initCuda();
+	VKRenderer::headless = options.headless;
 	VKRenderer::init();
 	CuRast::setup();
 
 	VKRenderer::onFileDrop([](vector<string> files){
 
 
-		if(files.size() != 1) return;
+		if(BenchmarkRun::enabled || files.size() != 1) return;
 
 		CuRast* editor = CuRast::instance;
 		Scene& scene = editor->scene;
@@ -431,10 +605,19 @@ int main(int argc, char** argv){
 	});
 
 	initScene();
+	if(BenchmarkRun::enabled){
+		recordBenchmarkRuntime();
+		BenchmarkRun::begin();
+	}
+
+	int nframes = BenchmarkRun::enabled ? BenchmarkRun::warmupFrames + BenchmarkRun::measuredFrames : options.nframes;
+	if(nframes == 0 && !options.output.empty()){
+		nframes = 1;
+	}
 
 	VKRenderer::loop(
 		[&]() {
-			update();
+			if(!BenchmarkRun::enabled) update();
 			CuRast::instance->update();
 			
 			DeviceState* state = CuRast::instance->deviceState;
@@ -445,9 +628,27 @@ int main(int argc, char** argv){
 			Runtime::debugValues["stage 2"] = format("{:.3f}", stage2_millies);
 			Runtime::debugValues["stage 3"] = format("{:.3f}", stage3_millies);
 		},
-		[&]() {CuRast::instance->render();},
-		[&]() {CuRast::instance->postFrame();}
+		[&]() {
+			int64_t frameNumber = VKRenderer::frameCount + 1;
+			if(!options.output.empty() && frameNumber == nframes){
+				CuRastSettings::requestScreenshot = make_shared<string>(options.output);
+			}
+			CuRast::instance->render();
+		},
+		[&]() {
+			CuRast::instance->postFrame();
+			int64_t frameNumber = VKRenderer::frameCount + 1;
+			if(nframes > 0 && frameNumber >= nframes){
+				glfwSetWindowShouldClose(VKRenderer::window, GLFW_TRUE);
+			}
+		}
 	);
 
+	if(BenchmarkRun::enabled) BenchmarkRun::complete();
 	VKRenderer::destroy();
+	return 0;
+	} catch(const std::exception& error) {
+		fprintf(stderr, "%s\n", error.what());
+		return 1;
+	}
 }

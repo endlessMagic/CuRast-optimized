@@ -4,6 +4,7 @@
 #include "CuRast.h"
 #include "VKRenderer.h"
 #include "TextureManager.h"
+#include "BenchmarkRun.h"
 
 using json = nlohmann::json;
 
@@ -111,6 +112,7 @@ void CuRast::inputHandling(){
 }
 
 void CuRast::drawGUI() {
+	if(BenchmarkRun::enabled) return;
 
 	if(!CuRastSettings::hideGUI){
 		makeMenubar();
@@ -166,16 +168,17 @@ void CuRast::update(){
 		return;
 	}
 
-	Timer::enabled = Runtime::measureTimings || Benchmarking::measurementCountdown >= 0;
+	Timer::enabled = BenchmarkRun::enabled || Runtime::measureTimings || Benchmarking::measurementCountdown >= 0;
 
 	launchArgs = getCommonLaunchArgs();
 
 	scene.updateTransformations();
-	inputHandling();
+	if(!BenchmarkRun::enabled) inputHandling();
 	// scene.updateTransformations();
 };
 
 void CuRast::postFrame(){
+	if(BenchmarkRun::enabled) return;
 	// some special benchmarking stuff
 
 	if(Benchmarking::measurementCountdown == 0){
